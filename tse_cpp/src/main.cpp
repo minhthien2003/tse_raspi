@@ -65,7 +65,7 @@ struct Args {
 const char* kConfigKeys[] = {
     "model", "emb", "encoder", "power", "gain", "lock_db", "threads",
     "in_device", "out_device", "save", "input", "output", "out_wav",
-    "seconds", "iters",
+    "seconds", "iters", "norm",
 };
 
 void ApplyOption(const std::string& key, const std::string& value, Args& a,
@@ -85,6 +85,13 @@ void ApplyOption(const std::string& key, const std::string& value, Args& a,
   else if (key == "out_wav")    a.out_wav     = value;
   else if (key == "seconds")    a.seconds     = std::atof(value.c_str());
   else if (key == "iters")      a.iters       = std::atoi(value.c_str());
+  else if (key == "norm") {
+    if (value != "off" && value != "peak") {
+      Die(std::string(origin) + ": norm chi nhan 'off' hoac 'peak', thay '" +
+          value + "'");
+    }
+    a.opt.norm_peak = value == "peak";
+  }
   else {
     // Go sai ten key ma bo qua im lang la cai bay: nguoi dung tuong da
     // doi cau hinh nhung thuc te khong.
@@ -166,6 +173,8 @@ Tham so chung:
   --gain N          gain dau ra dB
   --lock-db N       nguong LOCKED (mac dinh -8)
   --threads N       so thread ONNX (mac dinh 4)
+  --norm off|peak   chuan hoa am luong FILE dau ra len peak 0.95.
+                    Ap sau khi do xong nen khong lam lech so do suppress.
 
 Rieng tung mode:
   enroll   --encoder PATH  --seconds N  --wav PATH  --out-wav PATH
@@ -236,6 +245,12 @@ Args Parse(int argc, char** argv) {
     else if (k == "--gain")       a.opt.gain_db = std::atof(need(i)), ++i;
     else if (k == "--lock-db")    a.opt.lock_db = std::atof(need(i)), ++i;
     else if (k == "--threads")    a.opt.threads = std::atoi(need(i)), ++i;
+    else if (k == "--norm") {
+      const std::string v = need(i);
+      ++i;
+      if (v != "off" && v != "peak") Die("--norm chi nhan 'off' hoac 'peak'");
+      a.opt.norm_peak = v == "peak";
+    }
     else if (k == "--encoder")    a.encoder     = need(i), ++i;
     else if (k == "--save")       a.save        = need(i), ++i;
     else if (k == "--seconds")    a.seconds     = std::atof(need(i)), ++i;
@@ -734,6 +749,13 @@ int CmdLive(const Args& a) {
     const size_t n = std::min(rec_in.size(), rec_out.size());
     rec_in.resize(n);
     rec_out.resize(n);
+
+    if (a.opt.norm_peak) {
+      // Chi chuan hoa file da luu — khong anh huong am thanh phat ra luc
+      // chay, cung khong anh huong so do suppress.
+      NormalizePeak(&rec_out);
+      std::printf("  (--norm peak ap cho file output)\n");
+    }
 
     WriteWav(a.save + "_input.wav", rec_in, kSampleRate);
     WriteWav(a.save + "_output.wav", rec_out, kSampleRate);

@@ -20,8 +20,17 @@ struct ChunkStats {
   float     in_db       = -99.0f;
   float     out_db      = -99.0f;
   float     suppress_db = 0.0f;
+  float     mask        = 0.0f;   // mask model tao ra, TRUOC khi mu power
   double    ms          = 0.0;
 };
+
+// Doc mask trung binh: tach bach "loi tinh chinh" voi "loi embedding".
+const char* MaskVerdict(float mask);
+
+// Chuan hoa am luong file dau ra. Chi ap MOT he so cho ca tin hieu — chuan
+// hoa theo tung chunk se keo doan REJECT len ngang LOCKED, pha huy chinh
+// tac dung voice lock. Luon goi SAU khi da do suppress.
+void NormalizePeak(std::vector<float>* audio, float target_peak = 0.95f);
 
 // Tim file trong cac vi tri thong thuong: nguyen van, roi models/ o thu muc
 // hien tai, cha, va ong. Cho phep chay binary tu tse_cpp/build/ ma van thay
@@ -36,6 +45,7 @@ struct Options {
   float       gain_db    = 2.0f;     // bu gain dau ra
   float       lock_db    = kDefaultLockDb;
   int         threads    = 4;
+  bool        norm_peak  = false;   // --norm peak
 };
 
 class VoiceLock {

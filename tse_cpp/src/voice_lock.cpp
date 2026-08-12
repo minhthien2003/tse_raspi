@@ -19,6 +19,23 @@ const char* ToString(LockState s) {
   }
 }
 
+const char* MaskVerdict(float m) {
+  if (m > 0.80f) return "tot — model tu tin day la giong dich";
+  if (m > 0.65f) return "kha";
+  if (m > 0.45f) return "yeu — nghi ngo embedding khong khop";
+  return "rat yeu — model khong nhan ra giong nay";
+}
+
+void NormalizePeak(std::vector<float>* audio, float target_peak) {
+  float peak = 0.0f;
+  for (float v : *audio) peak = std::max(peak, std::fabs(v));
+
+  if (peak < 1e-8f) return;
+
+  const float g = target_peak / peak;
+  for (float& v : *audio) v *= g;
+}
+
 // ===========================================================================
 // Tim file
 // ===========================================================================
@@ -220,7 +237,9 @@ ChunkStats VoiceLock::Process(const float* in, int len,
   const float gain_in = 0.1f / in_rms;
   for (int i = 0; i < n; ++i) scratch_in_[i] = in[i] * gain_in;
 
-  const Spectrogram s = stft_.Forward(scratch_in_.data(), chunk_samples_);
+  // KHONG dat const: CreateTensor can float* khong hang, va de const thi
+  // phai copy ca ba mang 96632 phan tu moi chunk (~1.1 MB cap phat vo ich).
+  Spectrogram s = stft_.Forward(scratch_in_.data(), chunk_samples_);
 
   if (s.frames != frames_) {
     throw std::runtime_error(
@@ -239,7 +258,9 @@ ChunkStats VoiceLock::Process(const float* in, int len,
     return Ort::Value::CreateTensor<float>(mem_info_, v.data(), count, dims, 3);
   };
 
-  std::vector<float> mr = s.real, mi = s.imag, mm = s.mag;
+  std::vector<float>& mr = s.real;
+  std::vector<float>& mi = s.imag;
+  std::vector<float>& mm = s.mag;
 
   std::vector<Ort::Value> inputs;
   inputs.reserve(in_names_.size());
@@ -268,19 +289,34 @@ ChunkStats VoiceLock::Process(const float* in, int len,
   float* est_r = outputs[0].GetTensorMutableData<float>();
   float* est_i = outputs[1].GetTensorMutableData<float>();
 
-  // Mask sharpening: lay lai mask hieu dung roi mu len power.
-  if (opt_.power != 1.0f) {
-    for (size_t i = 0; i < count; ++i) {
-      const float em =
-          std::sqrt(est_r[i] * est_r[i] + est_i[i] * est_i[i] + kEps);
-      float mask = em / (mm[i] + kEps);
-      mask = std::max(0.0f, std::min(1.0f, mask));
-      mask = std::pow(mask, opt_.power);
+  // Mask hieu dung MA MODEL TAO RA, truoc khi mu len power. Day la chi so
+  // chan doan quan trong nhat, vi suy giam cuoi cung tuan theo:
+  //     suppress_dB = 20 * power * log10(mask)
+  // Lay trung binh CO TRONG SO theo bien do: cac bin gan nhu trong co ty le
+  // est/mix vo nghia, trung binh tran se bi chung keo lech.
+  double mask_num = 0.0;   // sum(mm * mask)
+  double mask_den = 0.0;   // sum(mm)
 
-      est_r[i] = mr[i] * mask;
-      est_i[i] = mi[i] * mask;
+  const bool sharpen = opt_.power != 1.0f;
+
+  for (size_t i = 0; i < count; ++i) {
+    const float em =
+        std::sqrt(est_r[i] * est_r[i] + est_i[i] * est_i[i] + kEps);
+
+    float mask = em / (mm[i] + kEps);
+    mask = std::max(0.0f, std::min(1.0f, mask));
+
+    mask_num += static_cast<double>(mm[i]) * mask;
+    mask_den += mm[i];
+
+    if (sharpen) {
+      const float sharp = std::pow(mask, opt_.power);
+      est_r[i] = mr[i] * sharp;
+      est_i[i] = mi[i] * sharp;
     }
   }
+
+  st.mask = static_cast<float>(mask_num / (mask_den + 1e-12));
 
   std::vector<float> wave(chunk_samples_);
   stft_.Inverse(est_r, est_i, s.frames, wave.data(), chunk_samples_);
