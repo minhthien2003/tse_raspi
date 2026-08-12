@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <random>
 #include <string>
 #include <thread>
@@ -45,11 +46,101 @@ struct Args {
 
   float seconds = 10.0f;
   int   iters   = 20;
+
+  std::string config_used;   // file config da nap, de in ra cho biet
 };
 
 [[noreturn]] void Die(const std::string& msg) {
   std::fprintf(stderr, "\nLOI: %s\n", msg.c_str());
   std::exit(1);
+}
+
+// ---------------------------------------------------------------------------
+// File config
+//
+// Dang key = value, '#' la ghi chu. Ap TRUOC khi doc argv de tham so dong
+// lenh luon thang file config.
+// ---------------------------------------------------------------------------
+
+const char* kConfigKeys[] = {
+    "model", "emb", "encoder", "power", "gain", "lock_db", "threads",
+    "in_device", "out_device", "save", "input", "output", "out_wav",
+    "seconds", "iters",
+};
+
+void ApplyOption(const std::string& key, const std::string& value, Args& a,
+                 const char* origin) {
+  if      (key == "model")      a.opt.model   = value;
+  else if (key == "emb")        a.opt.emb     = value;
+  else if (key == "encoder")    a.encoder     = value;
+  else if (key == "power")      a.opt.power   = std::atof(value.c_str());
+  else if (key == "gain")       a.opt.gain_db = std::atof(value.c_str());
+  else if (key == "lock_db")    a.opt.lock_db = std::atof(value.c_str());
+  else if (key == "threads")    a.opt.threads = std::atoi(value.c_str());
+  else if (key == "in_device")  a.in_device   = value;
+  else if (key == "out_device") a.out_device  = value;
+  else if (key == "save")       a.save        = value;
+  else if (key == "input")      a.input       = value;
+  else if (key == "output")     a.output      = value;
+  else if (key == "out_wav")    a.out_wav     = value;
+  else if (key == "seconds")    a.seconds     = std::atof(value.c_str());
+  else if (key == "iters")      a.iters       = std::atoi(value.c_str());
+  else {
+    // Go sai ten key ma bo qua im lang la cai bay: nguoi dung tuong da
+    // doi cau hinh nhung thuc te khong.
+    std::string valid;
+    for (const char* k : kConfigKeys) valid += std::string("  ") + k + "\n";
+
+    Die(std::string("Key khong hop le trong ") + origin + ": '" + key +
+        "'\n  Key hop le:\n" + valid);
+  }
+}
+
+std::string Trim(const std::string& s) {
+  const size_t b = s.find_first_not_of(" \t\r\n");
+  if (b == std::string::npos) return "";
+  return s.substr(b, s.find_last_not_of(" \t\r\n") - b + 1);
+}
+
+// Tra ve duong dan da dung, hoac chuoi rong neu khong co file nao.
+std::string LoadConfig(const std::string& path, Args& a) {
+  const std::string found = ResolvePath(path);
+  if (found.empty()) return "";
+
+  std::ifstream f(found);
+  if (!f) return "";
+
+  std::string line;
+  int lineno = 0;
+
+  while (std::getline(f, line)) {
+    ++lineno;
+
+    const size_t hash = line.find('#');
+    if (hash != std::string::npos) line = line.substr(0, hash);
+
+    line = Trim(line);
+    if (line.empty()) continue;
+
+    const size_t eq = line.find('=');
+    if (eq == std::string::npos) {
+      Die(found + ":" + std::to_string(lineno) +
+          ": thieu dau '=' o dong: " + line);
+    }
+
+    std::string key = Trim(line.substr(0, eq));
+    const std::string value = Trim(line.substr(eq + 1));
+
+    // Chap nhan ca 'lock-db' lan 'lock_db'
+    std::replace(key.begin(), key.end(), '-', '_');
+
+    if (value.empty()) continue;   // key co ma bo trong = giu mac dinh
+
+    ApplyOption(key, value,  a,
+                (found + ":" + std::to_string(lineno)).c_str());
+  }
+
+  return found;
 }
 
 void Usage() {
@@ -67,6 +158,8 @@ Mode:
   selftest  kiem tra STFT/iSTFT, khong can model
 
 Tham so chung:
+  --config PATH     file config (mac dinh tu tim voice_lock.conf)
+  --no-config       bo qua file config, chi dung mac dinh + dong lenh
   --model PATH      mac dinh v49_int8.onnx (tu tim trong models/)
   --emb PATH        mac dinh speaker_emb.npy
   --power N         mask sharpening (1=tat, 2=mac dinh, 3=manh)
@@ -81,10 +174,14 @@ Rieng tung mode:
   verify   --emb-target PATH  --emb-other PATH  -i PATH
   live     --save PREFIX  --in-device NAME  --out-device NAME
 
+Cau hinh:
+  Dat cac gia tri hay dung vao voice_lock.conf roi khoi go moi lan.
+  Thu tu uu tien: mac dinh < voice_lock.conf < tham so dong lenh.
+
 Vi du:
-  tse_voice_lock enroll --seconds 10
-  tse_voice_lock bench
-  tse_voice_lock live   --emb speaker_emb.npy --power 3 --save demo1
+  tse_voice_lock live                    # lay het tu voice_lock.conf
+  tse_voice_lock live --power 4          # nhu tren nhung ghi de power
+  tse_voice_lock bench --no-config       # bo qua config
 )");
 }
 
@@ -102,10 +199,38 @@ Args Parse(int argc, char** argv) {
     return argv[i + 1];
   };
 
+  // --- Luot 1: chi tim --config / --no-config -----------------------------
+  std::string config_path = "voice_lock.conf";
+  bool use_config = true;
+
+  for (int i = 2; i < argc; ++i) {
+    const std::string k = argv[i];
+    if (k == "--config") {
+      config_path = need(i);
+      ++i;
+    } else if (k == "--no-config") {
+      use_config = false;
+    }
+  }
+
+  if (use_config) {
+    const std::string loaded = LoadConfig(config_path, a);
+
+    if (!loaded.empty()) {
+      a.config_used = loaded;
+    } else if (config_path != "voice_lock.conf") {
+      // Go --config ro rang ma khong thay file thi phai bao, khong im lang
+      Die("Khong tim thay file config: " + config_path);
+    }
+  }
+
+  // --- Luot 2: tham so dong lenh, ghi de len config -----------------------
   for (int i = 2; i < argc; ++i) {
     const std::string k = argv[i];
 
-    if      (k == "--model")      a.opt.model   = need(i), ++i;
+    if      (k == "--config")     ++i;            // da xu ly o luot 1
+    else if (k == "--no-config")  ;               // da xu ly o luot 1
+    else if (k == "--model")      a.opt.model   = need(i), ++i;
     else if (k == "--emb")        a.opt.emb     = need(i), ++i;
     else if (k == "--power")      a.opt.power   = std::atof(need(i)), ++i;
     else if (k == "--gain")       a.opt.gain_db = std::atof(need(i)), ++i;

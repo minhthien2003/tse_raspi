@@ -818,6 +818,9 @@ def _build(args):
     print(f"  power : {args.power}   gain : +{args.gain} dB   "
           f"lock : {args.lock_db:+.1f} dB")
 
+    if getattr(args, "config_used", None):
+        print(f"  config: {args.config_used}")
+
     return VoiceLock(args.model, args.emb, args.power, args.gain,
                      args.lock_db, args.threads)
 
@@ -853,54 +856,164 @@ def cmd_devices(_args):
 
 
 # ============================================================================
+# FILE CONFIG
+#
+# Dang key = value, '#' la ghi chu. Gia tri trong file duoc dung lam
+# DEFAULT cua argparse, nen tham so dong lenh tu dong ghi de len no.
+# Thu tu uu tien: mac dinh <  voice_lock.conf  <  dong lenh
+# ============================================================================
+
+CONFIG_FILE = "voice_lock.conf"
+
+# key -> ham ep kieu
+CONFIG_KEYS = {
+    "model": str, "emb": str, "encoder": str,
+    "power": float, "gain": float, "lock_db": float,
+    "threads": int, "iters": int, "seconds": float,
+    "in_device": str, "out_device": str,
+    "save": str, "input": str, "output": str, "out_wav": str,
+}
+
+
+def _load_config(path=None):
+    """Doc file config. Tra ve (dict gia tri, duong dan da dung)."""
+    explicit = path is not None
+    found = _resolve(path or CONFIG_FILE)
+
+    if not os.path.exists(found):
+        if explicit:
+            raise SystemExit(f"Khong tim thay file config: {path}")
+        return {}, None
+
+    cfg = {}
+
+    with open(found, encoding="utf-8") as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+
+            if "=" not in line:
+                raise SystemExit(
+                    f"{found}:{lineno}: thieu dau '=' o dong: {line}")
+
+            key, value = line.split("=", 1)
+            key = key.strip().replace("-", "_")
+            value = value.strip()
+
+            if not value:
+                continue                      # key bo trong = giu mac dinh
+
+            if key not in CONFIG_KEYS:
+                # Go sai ten key ma bo qua im lang la cai bay: nguoi dung
+                # tuong da doi cau hinh nhung thuc te khong.
+                valid = "\n".join(f"  {k}" for k in sorted(CONFIG_KEYS))
+                raise SystemExit(
+                    f"{found}:{lineno}: key khong hop le '{key}'\n"
+                    f"  Key hop le:\n{valid}")
+
+            try:
+                cfg[key] = CONFIG_KEYS[key](value)
+            except ValueError:
+                raise SystemExit(
+                    f"{found}:{lineno}: '{value}' khong doi duoc sang "
+                    f"{CONFIG_KEYS[key].__name__} cho key '{key}'")
+
+    return cfg, found
+
+
+def _prescan_config(argv):
+    """Tim --config / --no-config truoc khi argparse chay."""
+    if "--no-config" in argv:
+        return None, True
+
+    if "--config" in argv:
+        i = argv.index("--config")
+        if i + 1 >= len(argv):
+            raise SystemExit("Thieu duong dan sau --config")
+        return argv[i + 1], False
+
+    return None, False
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 
 def main():
+    argv = [a for a in sys.argv[1:]]
+
+    config_path, skip = _prescan_config(argv)
+    cfg, cfg_used = ({}, None) if skip else _load_config(config_path)
+
+    # Bo --config/--no-config ra khoi argv de argparse khong phai biet toi
+    argv = [a for a in argv if a != "--no-config"]
+    if config_path is not None:
+        i = argv.index("--config")
+        del argv[i:i + 2]
+
+    def d(key, fallback):
+        """Gia tri mac dinh: lay tu config neu co, khong thi dung fallback."""
+        return cfg.get(key, fallback)
+
     p = argparse.ArgumentParser(
         description="V49 voice lock test — Raspberry Pi 5",
+        epilog="Dat cac gia tri hay dung vao voice_lock.conf "
+               "roi khoi go moi lan.\n"
+               "Thu tu uu tien: mac dinh < voice_lock.conf < dong lenh.\n"
+               "Bo qua config: --no-config    File khac: --config PATH",
         formatter_class=argparse.RawDescriptionHelpFormatter)
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def add_model_args(sp, need_emb=True):
-        sp.add_argument("--model", default="v49_int8.onnx",
+        sp.add_argument("--model", default=d("model", "v49_int8.onnx"),
                         help="file .onnx (tu do trong models/)")
         if need_emb:
-            sp.add_argument("--emb", default="speaker_emb.npy",
+            sp.add_argument("--emb", default=d("emb", "speaker_emb.npy"),
                             help="speaker embedding 512-d (.npy)")
-        sp.add_argument("--power", type=float, default=2.0,
+        sp.add_argument("--power", type=float, default=d("power", 2.0),
                         help="mask sharpening (1=tat, 2=mac dinh, 3=manh)")
-        sp.add_argument("--gain", type=float, default=2.0,
+        sp.add_argument("--gain", type=float, default=d("gain", 2.0),
                         help="gain dau ra (dB)")
-        sp.add_argument("--lock-db", type=float, default=DEFAULT_LOCK_DB,
+        sp.add_argument("--lock-db", type=float,
+                        default=d("lock_db", DEFAULT_LOCK_DB),
                         dest="lock_db", help="nguong quyet dinh LOCKED (dB)")
-        sp.add_argument("--threads", type=int, default=4,
+        sp.add_argument("--threads", type=int, default=d("threads", 4),
                         help="so thread ONNX (Pi 5 co 4 core)")
+        sp.add_argument("--config", metavar="PATH",
+                        help="file config (mac dinh tu tim voice_lock.conf)")
+        sp.add_argument("--no-config", action="store_true",
+                        help="bo qua file config")
 
     # enroll
     sp = sub.add_parser("enroll", help="tao speaker embedding")
-    sp.add_argument("--encoder", default=None,
+    sp.add_argument("--encoder", default=d("encoder", None),
                     help="WavLM encoder ONNX (khuyen dung tren Pi 5 — "
                          "khong can torch). Tao bang export_wavlm_onnx.py")
     sp.add_argument("--wav", default=None, help="dung file wav 16 kHz co san")
-    sp.add_argument("--seconds", type=float, default=10.0)
-    sp.add_argument("--emb", default="speaker_emb.npy")
-    sp.add_argument("--out-wav", default="enrollment.wav", dest="out_wav")
-    sp.add_argument("--in-device", default=None, dest="in_device")
+    sp.add_argument("--seconds", type=float, default=d("seconds", 10.0))
+    sp.add_argument("--emb", default=d("emb", "speaker_emb.npy"))
+    sp.add_argument("--out-wav", default=d("out_wav", "enrollment.wav"),
+                    dest="out_wav")
+    sp.add_argument("--in-device", default=d("in_device", None),
+                    dest="in_device")
+    sp.add_argument("--config", metavar="PATH")
+    sp.add_argument("--no-config", action="store_true")
     sp.set_defaults(func=cmd_enroll)
 
     # bench
     sp = sub.add_parser("bench", help="do latency / RTF tren Pi 5")
     add_model_args(sp)
-    sp.add_argument("--iters", type=int, default=20)
+    sp.add_argument("--iters", type=int, default=d("iters", 20))
     sp.set_defaults(func=cmd_bench)
 
     # file
     sp = sub.add_parser("file", help="tach giong tu file wav")
     add_model_args(sp)
-    sp.add_argument("-i", "--input", required=True)
-    sp.add_argument("-o", "--output", default="extracted.wav")
+    sp.add_argument("-i", "--input", default=d("input", None),
+                    required="input" not in cfg)
+    sp.add_argument("-o", "--output", default=d("output", "extracted.wav"))
     sp.set_defaults(func=cmd_file)
 
     # verify
@@ -908,22 +1021,27 @@ def main():
     add_model_args(sp, need_emb=False)
     sp.add_argument("--emb-target", required=True, dest="emb_target")
     sp.add_argument("--emb-other", required=True, dest="emb_other")
-    sp.add_argument("-i", "--input", required=True)
+    sp.add_argument("-i", "--input", default=d("input", None),
+                    required="input" not in cfg)
     sp.set_defaults(func=cmd_verify)
 
     # live
     sp = sub.add_parser("live", help="test realtime qua mic")
     add_model_args(sp)
-    sp.add_argument("--save", default=None, help="prefix luu wav in/out")
-    sp.add_argument("--in-device", default=None, dest="in_device")
-    sp.add_argument("--out-device", default=None, dest="out_device")
+    sp.add_argument("--save", default=d("save", None),
+                    help="prefix luu wav in/out")
+    sp.add_argument("--in-device", default=d("in_device", None),
+                    dest="in_device")
+    sp.add_argument("--out-device", default=d("out_device", None),
+                    dest="out_device")
     sp.set_defaults(func=cmd_live)
 
     # devices
     sp = sub.add_parser("devices", help="liet ke thiet bi audio")
     sp.set_defaults(func=cmd_devices)
 
-    args = p.parse_args()
+    args = p.parse_args(argv)
+    args.config_used = cfg_used
 
     for name in ("in_device", "out_device"):
         v = getattr(args, name, None)

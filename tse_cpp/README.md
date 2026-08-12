@@ -73,10 +73,10 @@ cũng được:
 ```bash
 cd build
 
-./tse_voice_lock devices                       # liệt kê thiết bị ALSA
-./tse_voice_lock enroll --seconds 10           # tạo speaker_emb.npy
+./tse_voice_lock devices                       # liệt kê card ALSA
+./tse_voice_lock enroll                        # tạo speaker_emb.npy
 ./tse_voice_lock bench                         # đo RTF
-./tse_voice_lock live --power 3 --save demo1   # realtime, ĐEO TAI NGHE
+./tse_voice_lock live                          # realtime, ĐEO TAI NGHE
 ./tse_voice_lock file -i mixed.wav -o out.wav
 ./tse_voice_lock verify --emb-target me.npy --emb-other other.npy -i mixed.wav
 ```
@@ -85,7 +85,61 @@ cd build
 [`export_wavlm_onnx.py`](../tse_run/export_wavlm_onnx.py) trên laptop).
 Không có nó thì enroll trên laptop rồi copy `speaker_emb.npy` sang.
 
-Tham số giống hệt bản Python: `--power`, `--gain`, `--lock-db`, `--threads`.
+### File config
+
+Các giá trị hay dùng đặt trong [`voice_lock.conf`](../voice_lock.conf) ở gốc
+project — dùng chung với bản Python, tự tìm ở `.`, `..`, `../..`:
+
+```ini
+model   = v49_int8.onnx
+emb     = speaker_emb.npy
+power   = 3
+gain    = 3
+lock_db = -8
+threads = 4
+
+in_device  = plughw:1,0
+out_device = plughw:2,0
+```
+
+Thứ tự ưu tiên: **mặc định < `voice_lock.conf` < tham số dòng lệnh**. Nên vẫn
+ghi đè được khi cần:
+
+```bash
+./tse_voice_lock live                # lấy hết từ config
+./tse_voice_lock live --power 4      # như trên nhưng power = 4
+./tse_voice_lock bench --no-config   # bỏ qua config
+./tse_voice_lock live --config /etc/tse/pi5.conf
+```
+
+Gõ sai tên key sẽ **báo lỗi kèm số dòng**, không bỏ qua im lặng — key bị lơ
+là cái bẫy khó phát hiện vì tưởng đã đổi cấu hình mà thực tế không.
+
+Dòng `config:` khi khởi động cho biết file nào đang được dùng.
+
+### Chọn card âm thanh
+
+`./tse_voice_lock devices` in số card kèm khả năng thật ở 16 kHz mono:
+
+```
+  card 1: USB PnP Sound Device
+           plughw:1,0  -> THU PHAT
+```
+
+Dùng `plughw:` chứ không dùng `hw:` — phần lớn mic USB không chạy 16 kHz
+native, `plughw` để ALSA tự chuyển.
+
+Nếu `default` hỏng (hay gặp trên Pi khi `asound.conf` khai báo `asym` mà
+thiếu nhánh capture, lỗi `capture slave is not defined`), code tự dò card
+khác và in ra nó chọn cái nào. Sửa tận gốc thì đặt `~/.asoundrc`:
+
+```
+pcm.!default {
+    type asym
+    playback.pcm "plughw:2,0"
+    capture.pcm  "plughw:1,0"
+}
+```
 
 ## Cấu trúc
 
