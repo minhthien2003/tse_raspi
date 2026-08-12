@@ -155,6 +155,44 @@ def db(x):
     return 20.0 * np.log10(max(x, 1e-8))
 
 
+def _mask_verdict(m):
+    """Doc mask trung binh cua model — chi so chan doan quan trong nhat.
+
+    Mask la ty le |est| / |mix| MA MODEL TAO RA, truoc khi mu len power.
+    Suy giam cuoi cung = 20 * power * log10(mask), da kiem chung bang so.
+    """
+    if m > 0.80:
+        return "tot — model tu tin day la giong dich"
+    if m > 0.65:
+        return "kha"
+    if m > 0.45:
+        return "yeu — nghi ngo embedding khong khop"
+    return "rat yeu — model khong nhan ra giong nay"
+
+
+def normalize_output(audio, mode, target_peak=0.95):
+    """Chuan hoa am luong file dau ra.
+
+    Chi ap dung MOT he so cho toan bo tin hieu, tuyet doi khong chuan hoa
+    theo tung chunk: lam vay se keo cac doan REJECT (giong nguoi khac) len
+    lai bang doan LOCKED, tuc la pha huy chinh tac dung voice lock.
+
+    Luon goi SAU khi da do suppress, de so do khong bi lech.
+    """
+    if mode == "off":
+        return audio
+
+    peak = float(np.abs(audio).max())
+
+    if peak < 1e-8:
+        return audio
+
+    if mode == "peak":
+        return (audio * (target_peak / peak)).astype(np.float32)
+
+    raise ValueError(f"--norm khong ho tro '{mode}'")
+
+
 # ============================================================================
 # EXTRACTOR
 # ============================================================================
@@ -284,6 +322,7 @@ class VoiceLock:
             return np.zeros(n, dtype=np.float32), {
                 "state": "SILENCE", "in_db": db(in_rms),
                 "out_db": -99.0, "suppress_db": 0.0, "ms": 0.0,
+                "mask": 0.0,
             }
 
         # Chuan hoa muc vao cho khop domain training
@@ -302,12 +341,23 @@ class VoiceLock:
              "mr": mr_b, "mi": mi_b, "mm": mm_b},
         )
 
-        # Mask sharpening: lay lai mask hieu dung roi mu len power
+        # Mask hieu dung MA MODEL TAO RA, truoc khi mu len power.
+        # Day la chi so chan doan quan trong nhat:
+        #   ~0.85  model tu tin day la giong dich
+        #   ~0.50  model khong chac -> nghi ngo embedding
+        # Lay trung binh co trong so theo bien do, vi cac bin gan nhu trong
+        # co ty le est/mix vo nghia.
+        est_mag = np.sqrt(est_r ** 2 + est_i ** 2 + EPS)
+        mask = np.clip(est_mag / (mm_b + EPS), 0.0, 1.0)
+
+        weight = float(mm_b.sum())
+        mask_mean = float((mm_b * mask).sum() / (weight + 1e-12))
+
+        # Mask sharpening: mu mask len power roi ap lai vao STFT goc
         if self.mask_power != 1.0:
-            est_mag = np.sqrt(est_r ** 2 + est_i ** 2 + EPS)
-            mask = np.clip(est_mag / (mm_b + EPS), 0.0, 1.0) ** self.mask_power
-            est_r = mr_b * mask
-            est_i = mi_b * mask
+            sharp = mask ** self.mask_power
+            est_r = mr_b * sharp
+            est_i = mi_b * sharp
 
         extracted = istft(est_r[0], est_i[0], self.chunk_samples)
         extracted = extracted / gain_in * self.output_gain
@@ -326,6 +376,7 @@ class VoiceLock:
             "in_db": db(in_rms),
             "out_db": db(out_rms),
             "suppress_db": suppress,
+            "mask": mask_mean,
             "ms": ms,
         }
 
@@ -755,8 +806,8 @@ def cmd_file(args):
 
     print(f"\n  {args.input} ({total / SR:.1f} s)")
     print(f"\n  {'t (s)':>8} {'in dB':>8} {'out dB':>9} "
-          f"{'suppress':>10} {'ms':>7}  state")
-    print("  " + "-" * 58)
+          f"{'suppress':>10} {'mask':>6} {'ms':>7}  state")
+    print("  " + "-" * 66)
 
     stats = []
     for start in range(0, total - win + 1, hop):
@@ -767,14 +818,22 @@ def cmd_file(args):
 
         stats.append(st)
         print(f"  {start / SR:8.1f} {st['in_db']:8.1f} {st['out_db']:9.1f} "
-              f"{st['suppress_db']:+9.1f} dB {st['ms']:6.0f}  {st['state']}")
+              f"{st['suppress_db']:+9.1f} dB {st['mask']:6.3f} {st['ms']:6.0f}"
+              f"  {st['state']}")
 
     output = np.where(weight > 1e-8, output / weight, 0.0)
 
     peak = float(np.abs(output).max())
-    if peak > 1.0:
+
+    if getattr(args, "norm", "off") != "off":
+        # Ap MOT he so cho ca file, sau khi da do xong suppress -> khong
+        # lam lech so do, va giu nguyen chenh lech giua LOCKED va REJECT.
+        output = normalize_output(output, args.norm)
+        print(f"\n  (--norm {args.norm}: peak {peak:.4f} -> "
+              f"{float(np.abs(output).max()):.4f})")
+    elif peak > 1.0:
         output /= peak
-        print(f"\n  (chuan hoa lai, peak was {peak:.2f})")
+        print(f"\n  (chuan hoa lai vi clipping, peak was {peak:.2f})")
 
     sf.write(args.output, output, SR)
 
@@ -900,8 +959,8 @@ def cmd_live(args):
         print(f"  ghi ra: {args.save}_input.wav / {args.save}_output.wav")
     print("  Ctrl+C de dung.\n")
     print(f"  {'chunk':>6} {'in dB':>8} {'out dB':>9} {'suppress':>10} "
-          f"{'ms':>7} {'RTF':>6}  state")
-    print("  " + "-" * 62)
+          f"{'mask':>6} {'ms':>7} {'RTF':>6}  state")
+    print("  " + "-" * 70)
 
     with sd.Stream(samplerate=SR, blocksize=hop_n, channels=1,
                    dtype="float32", callback=callback, latency="high",
@@ -916,7 +975,7 @@ def cmd_live(args):
                     bar = "#" * max(0, min(20, int(20 + st["suppress_db"])))
                     print(f"  {vl.n_chunks:>6} {st['in_db']:8.1f} "
                           f"{st['out_db']:9.1f} {st['suppress_db']:+9.1f} dB "
-                          f"{st['ms']:6.0f} {vl.rtf:6.3f}  "
+                          f"{st['mask']:6.3f} {st['ms']:6.0f} {vl.rtf:6.3f}  "
                           f"{st['state']:<7} {bar}")
         except KeyboardInterrupt:
             print("\n\n  Dung.")
@@ -928,8 +987,16 @@ def cmd_live(args):
         a = np.concatenate(rec_in)
         b = np.concatenate(rec_out)
         L = min(len(a), len(b))
-        sf.write(f"{args.save}_input.wav", a[:L], SR)
-        sf.write(f"{args.save}_output.wav", b[:L], SR)
+        a, b = a[:L], b[:L]
+
+        if getattr(args, "norm", "off") != "off":
+            # Chi chuan hoa file da luu, khong anh huong am thanh phat ra
+            # luc chay va cung khong anh huong so do suppress.
+            b = normalize_output(b, args.norm)
+            print(f"  (--norm {args.norm} ap cho file output)")
+
+        sf.write(f"{args.save}_input.wav", a, SR)
+        sf.write(f"{args.save}_output.wav", b, SR)
         print(f"\n  Da luu {L / SR:.1f} s:")
         print(f"    {args.save}_input.wav")
         print(f"    {args.save}_output.wav")
@@ -974,6 +1041,10 @@ def _summary(vl, stats):
     print(f"  REJECT         : {len(stats) - locked}")
     print(f"  suppress       : trung binh {sup.mean():+.1f} dB, "
           f"min {sup.min():+.1f} / max {sup.max():+.1f}")
+
+    mk = np.array([s["mask"] for s in stats])
+    print(f"  mask cua model : trung binh {mk.mean():.3f}  "
+          f"({_mask_verdict(mk.mean())})")
     print(f"  latency        : {vl.total_ms / vl.n_chunks:.0f} ms/chunk, "
           f"RTF {vl.rtf:.3f} "
           f"({'realtime OK' if vl.rtf < 1.0 else 'QUA CHAM'})")
@@ -1002,6 +1073,7 @@ CONFIG_KEYS = {
     "threads": int, "iters": int, "seconds": float,
     "in_device": str, "out_device": str,
     "save": str, "input": str, "output": str, "out_wav": str,
+    "norm": str,
 }
 
 
@@ -1111,6 +1183,11 @@ def main():
                         dest="lock_db", help="nguong quyet dinh LOCKED (dB)")
         sp.add_argument("--threads", type=int, default=d("threads", 4),
                         help="so thread ONNX (Pi 5 co 4 core)")
+        sp.add_argument("--norm", choices=("off", "peak"),
+                        default=d("norm", "off"),
+                        help="chuan hoa am luong FILE dau ra "
+                             "(peak = keo len 0.95). Khong lam lech so do "
+                             "suppress vi ap sau khi do xong.")
         sp.add_argument("--config", metavar="PATH",
                         help="file config (mac dinh tu tim voice_lock.conf)")
         sp.add_argument("--no-config", action="store_true",

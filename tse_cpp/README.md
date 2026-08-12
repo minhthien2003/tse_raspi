@@ -31,8 +31,7 @@ sudo apt install -y libasound2-dev cmake build-essential
 
 # 3. Build
 cd tse_cpp
-cmake -B build -DCMAKE_BUILD_TYPE=Release \
-      -DONNXRUNTIME_ROOT=$PWD/../onnxruntime-linux-aarch64-1.20.1
+cmake -B build -DCMAKE_BUILD_TYPE=Release  -DONNXRUNTIME_ROOT=$PWD/../onnxruntime-linux-aarch64-1.20.1
 cmake --build build -j4
 ```
 
