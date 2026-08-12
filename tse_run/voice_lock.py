@@ -57,6 +57,7 @@ Model duoc export voi shape TINH: T = 376 -> chunk bat buoc 3.0 s.
 
 import argparse
 import os
+import re
 import sys
 import time
 
@@ -168,6 +169,55 @@ def _mask_verdict(m):
     if m > 0.45:
         return "yeu — nghi ngo embedding khong khop"
     return "rat yeu — model khong nhan ra giong nay"
+
+
+def resolve_device(spec, want_input=True):
+    """Quy doi ten thiet bi sang chi so cua sounddevice.
+
+    Config dung chung voi ban C++, ma ban C++ goi ALSA truc tiep nen ghi
+    kieu 'plughw:2,0'. PortAudio khong hieu chuoi do, nhung ten thiet bi
+    cua no tren Linux thuong chua san '(hw:2,0)' -> bat theo do.
+
+    Chap nhan: None | so nguyen | '3' | 'plughw:2,0' | 'hw:2,0' | ten goi nho
+    """
+    if spec is None or isinstance(spec, int):
+        return spec
+
+    spec = str(spec).strip()
+
+    if spec.isdigit():
+        return int(spec)
+
+    if spec in ("default", ""):
+        return None
+
+    match = re.match(r"(?:plug)?hw:(\d+)(?:,(\d+))?$", spec)
+
+    if not match:
+        return spec           # de sounddevice tu khop theo ten
+
+    card = match.group(1)
+
+    try:
+        import sounddevice as sd
+        devices = sd.query_devices()
+    except Exception:
+        return None
+
+    # sounddevice dung snake_case (pyaudio moi dung camelCase)
+    key = "max_input_channels" if want_input else "max_output_channels"
+    needle = f"hw:{card},"
+
+    for i, dev in enumerate(devices):
+        if needle in dev["name"] and dev[key] > 0:
+            print(f"  {spec} -> [{i}] {dev['name']}")
+            return i
+
+    print(f"  Canh bao: khong map duoc '{spec}' sang thiet bi PortAudio.")
+    print(f"  Xem danh sach: python voice_lock.py devices")
+    print(f"  Dung chi so thay vi ten ALSA, vi du --in-device 3")
+
+    return None
 
 
 def normalize_output(audio, mode, target_peak=0.95):
@@ -447,8 +497,8 @@ def cmd_enroll(args):
         print("  Nen ghi lai o noi yen tinh hon.")
 
     print("\n  Test ngay:")
-    print(f"    python voice_lock.py live --model \"models/v49_int8 1.onnx\" "
-          f"--emb {args.emb} --power 3 --gain 3")
+    print(f"    python voice_lock.py inspect --emb {args.emb}")
+    print(f"    python voice_lock.py live --emb {args.emb}")
 
 
 # Cac thu muc se do khi duong dan tuong doi khong ton tai. Cho phep chay
@@ -1261,10 +1311,11 @@ def main():
     args = p.parse_args(argv)
     args.config_used = cfg_used
 
-    for name in ("in_device", "out_device"):
-        v = getattr(args, name, None)
-        if isinstance(v, str) and v.isdigit():
-            setattr(args, name, int(v))
+    # Quy doi ten thiet bi (ke ca kieu ALSA 'plughw:2,0' trong config
+    # dung chung voi ban C++) sang chi so cua sounddevice.
+    for name, is_input in (("in_device", True), ("out_device", False)):
+        if hasattr(args, name):
+            setattr(args, name, resolve_device(getattr(args, name), is_input))
 
     try:
         args.func(args)
