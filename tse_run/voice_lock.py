@@ -19,7 +19,7 @@ Cach dung
    a) Tren Pi 5 voi encoder ONNX — khong can torch (khuyen dung):
         # tren laptop, 1 lan: python export_wavlm_onnx.py
         # copy wavlm_sv_int8.onnx sang Pi, roi:
-        python voice_lock.py enroll --seconds 10 --encoder models/wavlm_sv_int8.onnx
+        python voice_lock.py enroll --seconds 10
 
    b) Tren laptop roi copy file speaker_emb.npy (2 KB) sang Pi.
 
@@ -28,18 +28,18 @@ Cach dung
         python voice_lock.py enroll --seconds 10
 
 2) Do toc do / RTF trên Pi 5:
-     python voice_lock.py bench --model "models/v49_int8 1.onnx" --emb speaker_emb.npy
+     python voice_lock.py bench --model v49_int8.onnx --emb speaker_emb.npy
 
 3) Test voice lock realtime qua mic (deo tai nghe de tranh hu):
-     python voice_lock.py live --model "models/v49_int8 1.onnx" --emb speaker_emb.npy \
+     python voice_lock.py live --model v49_int8.onnx --emb speaker_emb.npy \
          --power 3 --gain 3 --save demo1
 
 4) Test voice lock tren file wav san co:
-     python voice_lock.py file --model "models/v49_int8 1.onnx" --emb speaker_emb.npy \
+     python voice_lock.py file --model v49_int8.onnx --emb speaker_emb.npy \
          -i mixed.wav -o extracted.wav
 
 5) Kiem tra A/B (giong dung vs giong sai) tren 2 file:
-     python voice_lock.py verify --model "models/v49_int8 1.onnx" \
+     python voice_lock.py verify --model v49_int8.onnx \
          --emb-target target_emb.npy --emb-other other_emb.npy -i mixed.wav
 
 Tham so tinh chinh:
@@ -172,8 +172,17 @@ class VoiceLock:
                 "Thieu onnxruntime. Cai tren Pi 5:\n"
                 "    pip install onnxruntime numpy sounddevice soundfile")
 
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Khong tim thay model: {model_path}")
+        resolved = _resolve(model_path)
+
+        if not os.path.exists(resolved):
+            raise FileNotFoundError(
+                f"Khong tim thay model: {model_path}\n"
+                f"  Da do o: {', '.join(_SEARCH)}")
+
+        if resolved != model_path:
+            print(f"  -> {resolved}")
+
+        model_path = resolved
 
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = threads
@@ -391,13 +400,31 @@ def cmd_enroll(args):
           f"--emb {args.emb} --power 3 --gain 3")
 
 
+# Cac thu muc se do khi duong dan tuong doi khong ton tai. Cho phep chay
+# script tu bat ky dau ma van thay models/ o goc project.
+_SEARCH = ("models", "../models", "../../models", ".", "..", "../..")
+
+
+def _resolve(path):
+    """Tim file theo `path`, neu khong co thi do ten file trong _SEARCH."""
+    if not path or os.path.isabs(path) or os.path.exists(path):
+        return path
+
+    base = os.path.basename(path)
+    for folder in _SEARCH:
+        candidate = os.path.join(folder, base)
+        if os.path.exists(candidate):
+            return candidate
+
+    return path
+
+
 def _autodetect_encoder():
-    """Tu tim encoder ONNX o cac vi tri thong thuong."""
+    """Tu tim WavLM encoder ONNX trong cac vi tri thong thuong."""
     for name in ("wavlm_sv_int8.onnx", "wavlm_sv_fp32.onnx"):
-        for folder in ("models", "."):
-            path = os.path.join(folder, name)
-            if os.path.exists(path):
-                return path
+        path = _resolve(name)
+        if os.path.exists(path):
+            return path
     return None
 
 
@@ -459,6 +486,8 @@ def _embed_onnx(segments, encoder_path):
         import onnxruntime as ort
     except ImportError:
         raise SystemExit("Thieu onnxruntime: pip install onnxruntime")
+
+    encoder_path = _resolve(encoder_path)
 
     if not os.path.exists(encoder_path):
         raise SystemExit(
@@ -835,8 +864,8 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def add_model_args(sp, need_emb=True):
-        sp.add_argument("--model", default="models/v49_int8 1.onnx",
-                        help="duong dan file .onnx")
+        sp.add_argument("--model", default="v49_int8.onnx",
+                        help="file .onnx (tu do trong models/)")
         if need_emb:
             sp.add_argument("--emb", default="speaker_emb.npy",
                             help="speaker embedding 512-d (.npy)")
