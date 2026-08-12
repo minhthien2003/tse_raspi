@@ -555,6 +555,136 @@ def _embed_torch(segments):
 
 
 # ============================================================================
+# MODE: inspect — chan doan chat luong embedding
+# ============================================================================
+
+def cmd_inspect(args):
+    print("=" * 62)
+    print("PHAN TICH EMBEDDING")
+    print("=" * 62)
+
+    loaded = []
+
+    for path in args.emb:
+        resolved = _resolve(path)
+
+        if not os.path.exists(resolved):
+            print(f"\n  {path}: KHONG TIM THAY")
+            continue
+
+        raw = np.load(resolved)
+        label = os.path.splitext(os.path.basename(resolved))[0]
+
+        print(f"\n  {resolved}")
+        print(f"    shape      : {raw.shape}  {raw.dtype}")
+
+        flat = raw.astype(np.float64).ravel()
+
+        n_nan = int(np.isnan(flat).sum())
+        n_inf = int(np.isinf(flat).sum())
+        norm = float(np.linalg.norm(flat))
+        near_zero = int((np.abs(flat) < 1e-6).sum())
+
+        print(f"    L2 norm    : {norm:.4f}"
+              f"{'' if abs(norm - 1.0) < 0.01 else '   <-- khong phai vector don vi'}")
+        print(f"    mean/std   : {flat.mean():+.5f} / {flat.std():.5f}")
+        print(f"    min/max    : {flat.min():+.4f} / {flat.max():+.4f}")
+        print(f"    |x| < 1e-6 : {near_zero} / {flat.size}")
+        print(f"    NaN / Inf  : {n_nan} / {n_inf}")
+
+        # --- cac dang hong ---
+        problems = []
+
+        if flat.size != SPK_DIM:
+            problems.append(
+                f"kich thuoc {flat.size}, V49 can {SPK_DIM} -> khong dung duoc")
+        if n_nan or n_inf:
+            problems.append("co NaN/Inf -> file hong, enroll lai")
+        if norm < 1e-6:
+            problems.append(
+                "toan so 0 -> luc enroll thu duoc im lang. Kiem tra mic "
+                "(--in-device) va muc thu (alsamixer)")
+        elif flat.std() < 1e-6:
+            problems.append("moi phan tu gan nhu bang nhau -> embedding vo nghia")
+        if near_zero > flat.size * 0.5:
+            problems.append("qua nua phan tu bang 0 -> nghi ngo file hong")
+
+        if problems:
+            for p in problems:
+                print(f"    -> LOI: {p}")
+        else:
+            print(f"    -> OK")
+            loaded.append((label, flat / (norm + 1e-12)))
+
+    # ----------------------------------------------------------------
+    # So sanh tung cap
+    # ----------------------------------------------------------------
+    if len(loaded) > 1:
+        print("\n  Cosine tung cap:")
+        print()
+
+        width = max(len(n) for n, _ in loaded) + 2
+        print("  " + " " * width + "".join(f"{n[:9]:>10}" for n, _ in loaded))
+
+        for name_a, a in loaded:
+            row = f"  {name_a:<{width}}"
+            for _, b in loaded:
+                row += f"{float(np.dot(a, b)):>10.3f}"
+            print(row)
+
+    # ----------------------------------------------------------------
+    # So voi ban ghi moi — phep kiem manh nhat
+    # ----------------------------------------------------------------
+    if args.wav:
+        import soundfile as sf
+
+        audio, sr = sf.read(_resolve(args.wav), dtype="float32")
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        if sr != SR:
+            raise SystemExit(f"{args.wav} la {sr} Hz, can {SR} Hz")
+
+        print(f"\n  Tinh embedding tu {args.wav} ({len(audio)/SR:.1f} s)")
+
+        encoder = args.encoder or _autodetect_encoder()
+        fresh, n_seg, consistency = _wavlm_embedding(audio, encoder)
+
+        print(f"  {n_seg} segment, consistency {consistency:.3f}")
+        print("\n  Cosine voi cac embedding o tren:")
+
+        for name, e in loaded:
+            cos = float(np.dot(fresh, e))
+            if cos > 0.85:
+                verdict = "khop rat tot"
+            elif cos > 0.7:
+                verdict = "khop"
+            elif cos > 0.5:
+                verdict = "yeu — co the khac nguoi"
+            else:
+                verdict = "KHONG khop"
+            print(f"    {name:<20} {cos:>6.3f}   {verdict}")
+
+    # ----------------------------------------------------------------
+    # Moc tham chieu
+    # ----------------------------------------------------------------
+    rng = np.random.default_rng(0)
+    r = rng.normal(size=(2000, SPK_DIM))
+    r /= np.linalg.norm(r, axis=1, keepdims=True)
+
+    # abs PHAI dat ngoai tong: can |tich vo huong|, khong phai tong |a_i*b_i|
+    cos_random = (r[:1000] * r[1000:]).sum(axis=1)
+    baseline = float(np.abs(cos_random).mean())
+
+    print("\n  Moc tham chieu:")
+    print(f"    2 vector ngau nhien {SPK_DIM}-d : |cos| ~ {baseline:.3f}"
+          f"  (do lech chuan {cos_random.std():.3f})")
+    print("    cung nguoi, ban ghi khac  : thuong > 0.85")
+    print("    khac nguoi                : thuong 0.5 - 0.8")
+    print("\n  Cosine giua hai nguoi khac nhau ma > 0.95 nghia la embedding")
+    print("  khong phan biet duoc ai — kiem tra lai buoc enroll.")
+
+
+# ============================================================================
 # MODE: bench
 # ============================================================================
 
@@ -1035,6 +1165,17 @@ def main():
     sp.add_argument("--out-device", default=d("out_device", None),
                     dest="out_device")
     sp.set_defaults(func=cmd_live)
+
+    # inspect
+    sp = sub.add_parser("inspect", help="chan doan chat luong embedding")
+    sp.add_argument("--emb", nargs="+", default=[d("emb", "speaker_emb.npy")],
+                    help="mot hoac nhieu file .npy de so sanh")
+    sp.add_argument("--wav", default=None,
+                    help="ban ghi moi de doi chieu voi embedding da luu")
+    sp.add_argument("--encoder", default=d("encoder", None))
+    sp.add_argument("--config", metavar="PATH")
+    sp.add_argument("--no-config", action="store_true")
+    sp.set_defaults(func=cmd_inspect)
 
     # devices
     sp = sub.add_parser("devices", help="liet ke thiet bi audio")
