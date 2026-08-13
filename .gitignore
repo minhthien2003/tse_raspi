@@ -3,6 +3,8 @@ models/
 
 # Build C++
 tse_cpp/build/
+cpp/build/
+cpp_test/build/
 
 # Python
 __pycache__/

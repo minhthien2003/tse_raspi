@@ -30,14 +30,35 @@ sudo apt install -y build-essential cmake pkg-config \
     libfftw3-dev libsndfile1-dev portaudio19-dev
 ```
 
-ONNX Runtime C++ must also be installed on the Pi. The CMake file expects it under `/opt/onnxruntime` by default.
+ONNX Runtime C++ (aarch64) is also required. By default both the build script and CMake look for it at `<repo>/onnxruntime-linux-aarch64-1.29.0`, which is already unpacked in this repo. Pi OS must be 64-bit.
 
 ## Build
 
 ```bash
-cmake -S . -B build -DONNXRUNTIME_ROOT=/opt/onnxruntime
-cmake --build build -j4
+cd cpp_test
+./build.sh              # build Release -> build/v49_pi5
 ```
+
+Options:
+
+```bash
+./build.sh --deps       # apt install build deps, then build
+./build.sh --clean      # wipe build/ and reconfigure
+./build.sh --debug      # Debug build
+./build.sh --fetch-ort  # download onnxruntime-linux-aarch64-1.29.0 if missing
+./build.sh --ort /path/to/onnxruntime-linux-aarch64-1.29.0
+./build.sh -j 4         # limit parallel jobs
+```
+
+Manual equivalent:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DONNXRUNTIME_ROOT=$PWD/../onnxruntime-linux-aarch64-1.29.0
+cmake --build build -j"$(nproc)"
+```
+
+The ONNX Runtime `lib/` directory is baked into the binary's RPATH, so no `LD_LIBRARY_PATH` is needed at runtime as long as that directory stays in place.
 
 ## File test
 
