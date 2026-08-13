@@ -78,7 +78,7 @@ if [[ ${#MISSING_PKG[@]} -gt 0 ]]; then
 fi
 
 echo "==> Kiem tra ONNX Runtime: ${ORT_ROOT}"
-if [[ ! -f "${ORT_ROOT}/include/onnxruntime_cxx_api.h" || ! -f "${ORT_ROOT}/lib/libonnxruntime.so" ]]; then
+if [[ ! -f "${ORT_ROOT}/include/onnxruntime_cxx_api.h" || ! -s "${ORT_ROOT}/lib/libonnxruntime.so.${ORT_VERSION}" ]]; then
   if [[ ${FETCH_ORT} -eq 1 ]]; then
     echo "    Khong thay, dang tai ${ORT_NAME}..."
     tmp="$(mktemp -d)"
@@ -96,6 +96,22 @@ if [[ ! -f "${ORT_ROOT}/include/onnxruntime_cxx_api.h" || ! -f "${ORT_ROOT}/lib/
     exit 1
   fi
 fi
+
+# Bo phan mem/qua Windows lam mat symlink -> libonnxruntime.so va .so.1 thanh
+# file rong 0 byte. Link se bao "undefined reference to OrtGetApiBase", va luc
+# chay loader cung khong tim thay SONAME libonnxruntime.so.1. Tao lai symlink.
+echo "==> Kiem tra symlink thu vien"
+ORT_LIB_DIR="${ORT_ROOT}/lib"
+ORT_REAL="libonnxruntime.so.${ORT_VERSION}"
+for lnk in "libonnxruntime.so.1" "libonnxruntime.so"; do
+  target="${ORT_LIB_DIR}/${lnk}"
+  if [[ -L "${target}" && -s "${target}" ]]; then
+    continue
+  fi
+  echo "    tao lai ${lnk} -> ${ORT_REAL}"
+  rm -f "${target}"
+  ln -s "${ORT_REAL}" "${target}"
+done
 
 if [[ ${DO_CLEAN} -eq 1 ]]; then
   echo "==> Xoa ${BUILD_DIR}"

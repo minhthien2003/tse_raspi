@@ -57,6 +57,20 @@ if(NOT ORT_INCLUDE_DIR OR NOT ORT_LIBRARY)
     "    cmake -B build -DONNXRUNTIME_ROOT=$PWD/onnxruntime-linux-aarch64-1.29.0")
 endif()
 
+# Symlink libonnxruntime.so co the bi bien thanh file rong 0 byte khi repo di
+# qua Windows. Link vao no se bao "undefined reference to OrtGetApiBase".
+file(SIZE "${ORT_LIBRARY}" ORT_LIBRARY_SIZE)
+if(ORT_LIBRARY_SIZE EQUAL 0)
+  message(FATAL_ERROR
+    "${ORT_LIBRARY} rong 0 byte - symlink da bi hong.\n"
+    "  Sua bang:\n"
+    "    cd ${ONNXRUNTIME_ROOT}/lib\n"
+    "    rm -f libonnxruntime.so libonnxruntime.so.1\n"
+    "    ln -s libonnxruntime.so.1.29.0 libonnxruntime.so.1\n"
+    "    ln -s libonnxruntime.so.1      libonnxruntime.so\n"
+    "  Hoac chay lai ./build.sh, script se tu tao lai symlink.")
+endif()
+
 message(STATUS "ONNX Runtime root   : ${ONNXRUNTIME_ROOT}")
 message(STATUS "ONNX Runtime include: ${ORT_INCLUDE_DIR}")
 message(STATUS "ONNX Runtime library: ${ORT_LIBRARY}")
