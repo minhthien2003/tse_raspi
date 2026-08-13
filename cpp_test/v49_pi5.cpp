@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <csignal>
 #include <cstdio>
 #include <chrono>
 #include <cmath>
@@ -499,9 +500,16 @@ struct RealtimeContext {
     std::vector<float> rec_input;
     std::vector<float> rec_output;
     std::string save_prefix;
+    bool record = false;
 
     //std::mutex process_mutex;
 };
+
+// Ctrl+C phai thoat vong lap chinh mot cach co trat tu, neu khong tien trinh
+// bi giet ngay va phan ghi file WAV o cuoi realtime() khong bao gio chay.
+static volatile std::sig_atomic_t g_stop = 0;
+
+static void on_signal(int) { g_stop = 1; }
 
 static int pa_callback(const void* input,
                        void* output,
@@ -517,7 +525,7 @@ static int pa_callback(const void* input,
 
     for (int i = 0; i < shift; ++i) {
         float x = in ? in[i] : 0.0f;
-        ctx->rec_input.push_back(x);
+        if (ctx->record) ctx->rec_input.push_back(x);
         std::rotate(ctx->input_buffer.begin(),
                     ctx->input_buffer.begin() + 1,
                     ctx->input_buffer.end());
@@ -548,7 +556,7 @@ static int pa_callback(const void* input,
         float w = ctx->output_weight[i];
         float y = w > 1e-8f ? ctx->output_buffer[i] / w : 0.0f;
         out[i] = y;
-        ctx->rec_output.push_back(y);
+        if (ctx->record) ctx->rec_output.push_back(y);
     }
 
     std::rotate(ctx->output_buffer.begin(),
@@ -670,6 +678,15 @@ static void realtime(V49Extractor& extractor, const std::string& save_prefix,
     RealtimeContext ctx;
     ctx.extractor = &extractor;
     ctx.save_prefix = save_prefix;
+    ctx.record = !save_prefix.empty();
+
+    // push_back trong callback audio se cap phat lai bo nho ngay trong luong
+    // realtime va gay ngat tieng. Dat truoc suc chua cho 10 phut ghi am.
+    if (ctx.record) {
+        const size_t cap = static_cast<size_t>(SR) * 600;
+        ctx.rec_input.reserve(cap);
+        ctx.rec_output.reserve(cap);
+    }
 
     StderrSilencer hush(quiet_probe);
     PaError err = Pa_Initialize();
@@ -749,7 +766,11 @@ static void realtime(V49Extractor& extractor, const std::string& save_prefix,
                   << save_prefix << "_output.wav\n";
     std::cout << "  Ctrl+C to stop\n\n";
 
-    while (Pa_IsStreamActive(stream) == 1) {
+    g_stop = 0;
+    std::signal(SIGINT, on_signal);
+    std::signal(SIGTERM, on_signal);
+
+    while (Pa_IsStreamActive(stream) == 1 && !g_stop) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         long n = ctx.chunks_processed.load();
         if (n > 0) {
@@ -762,14 +783,28 @@ static void realtime(V49Extractor& extractor, const std::string& save_prefix,
         }
     }
 
+    // Tu day tro di dung handler nua: Ctrl+C lan hai se giet that, phong khi
+    // buoc dong stream bi treo.
+    std::signal(SIGINT, SIG_DFL);
+    std::signal(SIGTERM, SIG_DFL);
+
+    if (g_stop) std::cout << "\n\nStopping...\n";
+
     Pa_StopStream(stream);
     Pa_CloseStream(stream);
     Pa_Terminate();
 
-    if (!save_prefix.empty() && !ctx.rec_input.empty()) {
-        write_wav_mono(save_prefix + "_input.wav", ctx.rec_input);
-        write_wav_mono(save_prefix + "_output.wav", ctx.rec_output);
-        std::cout << "\nSaved recordings.\n";
+    if (!save_prefix.empty()) {
+        if (ctx.rec_input.empty()) {
+            std::cout << "\nNothing recorded - no audio was captured.\n";
+        } else {
+            write_wav_mono(save_prefix + "_input.wav", ctx.rec_input);
+            write_wav_mono(save_prefix + "_output.wav", ctx.rec_output);
+            const double secs = static_cast<double>(ctx.rec_input.size()) / SR;
+            std::cout << "Saved " << std::fixed << std::setprecision(1) << secs << "s:\n"
+                      << "  " << save_prefix << "_input.wav\n"
+                      << "  " << save_prefix << "_output.wav\n";
+        }
     }
 }
 
