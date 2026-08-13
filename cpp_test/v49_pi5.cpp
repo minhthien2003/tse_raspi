@@ -488,13 +488,14 @@ struct RealtimeContext {
     int samples_received = 0;
     std::atomic<bool> running{true};
     std::atomic<long> chunks_processed{0};
-    std::atomic<double> total_latency_ms{0.0};
+    double total_latency_ms = 0.0;
+    //std::atomic<double> total_latency_ms{0.0};
 
     std::vector<float> rec_input;
     std::vector<float> rec_output;
     std::string save_prefix;
 
-    std::mutex process_mutex;
+    //std::mutex process_mutex;
 };
 
 static int pa_callback(const void* input,
@@ -528,7 +529,8 @@ static int pa_callback(const void* input,
         auto t1 = std::chrono::steady_clock::now();
 
         const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        ctx->total_latency_ms.fetch_add(ms);
+        //ctx->total_latency_ms.fetch_add(ms);
+        ctx->total_latency_ms += ms;
         ctx->chunks_processed.fetch_add(1);
 
         for (int i = 0; i < CHUNK_SAMPLES; ++i) {
@@ -605,7 +607,8 @@ static void realtime(V49Extractor& extractor, const std::string& save_prefix) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         long n = ctx.chunks_processed.load();
         if (n > 0) {
-            double avg = ctx.total_latency_ms.load() / n;
+            //double avg = ctx.total_latency_ms.load() / n;
+            double avg = ctx.total_latency_ms / n;
             double rtf = avg / 3000.0;
             std::cout << "\r  chunks " << n
                       << "  latency " << std::fixed << std::setprecision(0) << avg << " ms"
