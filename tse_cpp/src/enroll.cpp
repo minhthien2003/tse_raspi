@@ -13,7 +13,7 @@ namespace tse {
 
 namespace {
 
-// Cat thanh segment 3 s chong lan 1.5 s, bo doan im lang.
+// Splits into 3 s segments overlapping by 1.5 s, dropping silent ones.
 std::vector<std::vector<float>> Segment(const std::vector<float>& audio) {
   std::vector<std::vector<float>> segs;
 
@@ -27,7 +27,7 @@ std::vector<std::vector<float>> Segment(const std::vector<float>& audio) {
   }
 
   if (segs.empty()) {
-    std::printf("  Khong co segment nao du to — dung toan bo audio\n");
+    std::printf("  No segment was loud enough - using the whole recording\n");
 
     std::vector<float> pad = audio;
     while (static_cast<int>(pad.size()) < kEnrollSegment && !audio.empty()) {
@@ -46,7 +46,7 @@ EnrollResult ComputeEmbedding(const std::string& encoder_path,
                               const std::vector<float>& audio, int threads) {
   const std::vector<std::vector<float>> segs = Segment(audio);
 
-  std::printf("\n  Encoder ONNX: %s\n", encoder_path.c_str());
+  std::printf("\n  ONNX encoder: %s\n", encoder_path.c_str());
 
   Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "enroll");
 
@@ -62,8 +62,8 @@ EnrollResult ComputeEmbedding(const std::string& encoder_path,
 
   if (in_name != "input_values") {
     throw std::runtime_error(
-        "Encoder khong dung interface. Can input 'input_values', thay '" +
-        in_name + "'.\n  Tao lai bang: python export_wavlm_onnx.py");
+        "Encoder interface mismatch. Expected input 'input_values', found '" +
+        in_name + "'.\n  Rebuild it with: python export_wavlm_onnx.py");
   }
 
   auto mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
@@ -74,7 +74,7 @@ EnrollResult ComputeEmbedding(const std::string& encoder_path,
   std::vector<std::vector<float>> embs;
   embs.reserve(segs.size());
 
-  std::printf("  %zu segment", segs.size());
+  std::printf("  %zu segments", segs.size());
   std::fflush(stdout);
 
   std::vector<float> norm;
@@ -94,7 +94,7 @@ EnrollResult ComputeEmbedding(const std::string& encoder_path,
 
     if (static_cast<int>(n) != kSpkDim) {
       throw std::runtime_error(
-          "Encoder tra ve " + std::to_string(n) + "-d, V49 can " +
+          "Encoder returned " + std::to_string(n) + "-d, V49 needs " +
           std::to_string(kSpkDim) + "-d");
     }
 
@@ -112,9 +112,9 @@ EnrollResult ComputeEmbedding(const std::string& encoder_path,
     std::fflush(stdout);
   }
 
-  std::printf(" xong\n");
+  std::printf(" done\n");
 
-  // Trung binh roi chuan hoa lai
+  // Average, then renormalize
   std::vector<float> avg(kSpkDim, 0.0f);
   for (const auto& e : embs) {
     for (int i = 0; i < kSpkDim; ++i) avg[i] += e[i];
@@ -128,7 +128,7 @@ EnrollResult ComputeEmbedding(const std::string& encoder_path,
   norm2 = std::sqrt(norm2) + 1e-8;
   for (float& v : avg) v = static_cast<float>(v / norm2);
 
-  // Consistency = cosine trung binh giua moi cap segment
+  // Consistency = mean cosine over every pair of segments
   float consistency = 1.0f;
 
   if (embs.size() > 1) {

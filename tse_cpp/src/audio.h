@@ -1,5 +1,6 @@
-// audio.h — thu/phat qua ALSA. Khong dung PortAudio de giam phu thuoc
-// khi dong image nhung (Yocto / i.MX 95).
+// audio.h - capture and playback through ALSA. PortAudio is deliberately
+// avoided to keep the dependency list short when building an embedded image
+// (Yocto / i.MX 95).
 #pragma once
 
 #include <string>
@@ -9,9 +10,9 @@ namespace tse {
 
 class AlsaDevice {
  public:
-  // `device` kieu "default", "plughw:1,0". `period` la so frame moi lan
-  // doc/ghi. Buffer duoc dat 4 x period de nhan doc van chay tiep trong
-  // luc CPU dang chay model.
+  // `device` looks like "default" or "plughw:1,0". `period` is the number of
+  // frames per read/write. The buffer is sized at 4 x period so the kernel
+  // keeps capturing while the CPU is busy running the model.
   AlsaDevice(const std::string& device, int sample_rate, int period,
              bool capture);
   ~AlsaDevice();
@@ -19,11 +20,11 @@ class AlsaDevice {
   AlsaDevice(const AlsaDevice&) = delete;
   AlsaDevice& operator=(const AlsaDevice&) = delete;
 
-  // Tra ve false neu khong khoi phuc duoc sau xrun.
+  // Returns false when recovery from an xrun fails.
   bool Read(float* dst, int frames);
   bool Write(const float* src, int frames);
 
-  // Ghi im lang de mo buffer phat truoc khi vao vong lap.
+  // Writes silence to prime the playback buffer before entering the loop.
   void Prefill(int frames);
 
   int xruns() const { return xruns_; }
@@ -34,7 +35,7 @@ class AlsaDevice {
   int   xruns_ = 0;
 };
 
-// In danh sach card/thiet bi PCM.
+// Prints the available sound cards and PCM devices.
 void ListDevices();
 
 }  // namespace tse

@@ -1,32 +1,32 @@
 #!/usr/bin/env python3
 """
-EXPORT WAVLM SPEAKER ENCODER -> ONNX
-=====================================
+EXPORT THE WAVLM SPEAKER ENCODER TO ONNX
+=========================================
 
-Chay MOT LAN tren laptop (hoac Colab) de bo hoan toan PyTorch khoi Pi 5.
-Sau khi co file .onnx, Pi 5 co the tu enroll ma khong can torch/transformers.
+Run this ONCE on a laptop to remove PyTorch from the Pi 5 entirely. With the
+resulting .onnx file the Pi can enroll new speakers on its own.
 
-Cai dat (chi tren may export):
+Install (only on the machine doing the export):
     pip install torch transformers onnx onnxruntime
 
-Chay:
-    python export_wavlm_onnx.py                    # tao ca fp32 + int8
-    python export_wavlm_onnx.py --no-int8          # chi fp32
+Run:
+    python export_wavlm_onnx.py                    # produces fp32 + int8
+    python export_wavlm_onnx.py --no-int8          # fp32 only
     python export_wavlm_onnx.py --outdir models
 
-Ket qua:
+Output:
     wavlm_sv_fp32.onnx   (~380 MB)
-    wavlm_sv_int8.onnx   (~95 MB)  <- copy file nay sang Pi 5
+    wavlm_sv_int8.onnx   (~95 MB)  <- copy this one to the Pi 5
 
 Interface:
-    input : input_values [1, N]  float32, audio 16 kHz da chuan hoa mean/var
-    output: embeddings   [1, 512] float32 (chua L2-normalize)
+    input : input_values [1, N]  float32, 16 kHz audio, mean/var normalized
+    output: embeddings   [1, 512] float32 (NOT L2-normalized)
 
-Truc thoi gian la dynamic, nhung enroll luon dung segment 3 s (48000 samples).
+The time axis is dynamic, but enrollment always feeds 3 s segments
+(48000 samples).
 """
 
 import argparse
-import os
 import sys
 import time
 from pathlib import Path
@@ -40,7 +40,7 @@ MODEL_ID = "microsoft/wavlm-base-plus-sv"
 
 
 class XVectorWrapper:
-    """Bao WavLMForXVector de forward() tra thang tensor embeddings."""
+    """Wraps WavLMForXVector so forward() returns the embeddings tensor."""
 
     def __new__(cls, model):
         import torch.nn as nn
@@ -62,8 +62,8 @@ def export(outdir, do_int8, opset):
         from transformers import WavLMForXVector
     except ImportError:
         raise SystemExit(
-            "Can: pip install torch transformers onnx onnxruntime\n"
-            "Chay script nay tren laptop, KHONG phai tren Pi 5.")
+            "Requires: pip install torch transformers onnx onnxruntime\n"
+            "Run this on a laptop, NOT on the Pi 5.")
 
     import onnx
     import onnxruntime as ort
@@ -79,7 +79,7 @@ def export(outdir, do_int8, opset):
     print("=" * 62)
 
     # ------------------------------------------------------------------
-    print(f"\n[1] Load {MODEL_ID}")
+    print(f"\n[1] Loading {MODEL_ID}")
     base = WavLMForXVector.from_pretrained(MODEL_ID).eval()
     model = XVectorWrapper(base).eval()
 
@@ -87,7 +87,7 @@ def export(outdir, do_int8, opset):
     print(f"    params: {n_params:,} ({n_params * 4 / 1e6:.0f} MB fp32)")
 
     # ------------------------------------------------------------------
-    print(f"\n[2] Export fp32 (opset {opset}, truc thoi gian dynamic)")
+    print(f"\n[2] Exporting fp32 (opset {opset}, dynamic time axis)")
     torch.manual_seed(0)
     dummy = torch.randn(1, SEG_SAMPLES)
 
@@ -106,7 +106,7 @@ def export(outdir, do_int8, opset):
     print(f"    {fp32_path.name}  ({fp32_path.stat().st_size / 1e6:.0f} MB)")
 
     # ------------------------------------------------------------------
-    print("\n[3] Parity check PyTorch vs ONNX fp32")
+    print("\n[3] Parity check: PyTorch vs ONNX fp32")
     with torch.no_grad():
         ref = model(dummy).numpy()
 
@@ -117,11 +117,11 @@ def export(outdir, do_int8, opset):
     cos = _cos(ref, got)
     print(f"    max diff : {np.abs(ref - got).max():.2e}")
     print(f"    cosine   : {cos:.6f}  "
-          f"{'OK' if cos > 0.9999 else 'CANH BAO — lech qua nhieu'}")
+          f"{'OK' if cos > 0.9999 else 'WARNING - drifted too far'}")
 
     # ------------------------------------------------------------------
     if do_int8:
-        print("\n[4] Quantize INT8 (dynamic)")
+        print("\n[4] Dynamic INT8 quantization")
         from onnxruntime.quantization import quantize_dynamic, QuantType
 
         quantize_dynamic(str(fp32_path), str(int8_path),
@@ -137,13 +137,13 @@ def export(outdir, do_int8, opset):
         print(f"    cosine vs fp32: {cos8:.4f}")
 
         if cos8 < 0.98:
-            print("    CANH BAO: INT8 lech nhieu — nen dung ban fp32 cho enroll.")
-            print("    Enroll chi chay 1 lan nen fp32 khong ton kem gi.")
+            print("    WARNING: INT8 drifts a lot - prefer fp32 for enrollment.")
+            print("    Enrollment runs once, so fp32 costs you nothing.")
         else:
-            print("    INT8 dung duoc cho enroll.")
+            print("    INT8 is good enough for enrollment.")
 
     # ------------------------------------------------------------------
-    print("\n[5] Latency (1 segment 3 s)")
+    print("\n[5] Latency for one 3 s segment")
     feed = {"input_values": dummy.numpy()}
     for _ in range(2):
         sess.run(None, feed)
@@ -151,15 +151,15 @@ def export(outdir, do_int8, opset):
     for _ in range(5):
         sess.run(None, feed)
     print(f"    fp32: {(time.perf_counter() - t0) * 1000 / 5:.0f} ms "
-          f"(tren may nay; Pi 5 cham hon ~5-10x)")
+          f"(on this machine; a Pi 5 is roughly 5-10x slower)")
 
     # ------------------------------------------------------------------
     print("\n" + "=" * 62)
-    print("XONG")
+    print("DONE")
     print("=" * 62)
     best = int8_path if do_int8 else fp32_path
-    print(f"\n  Copy sang Pi 5:  {best.name}")
-    print("\n  Tren Pi 5, enroll khong can torch:")
+    print(f"\n  Copy to the Pi 5:  {best.name}")
+    print("\n  On the Pi 5, enrollment then needs no PyTorch:")
     print(f"    python voice_lock.py enroll --seconds 10 \\")
     print(f"        --encoder {best.name} --emb speaker_emb.npy")
 
@@ -171,7 +171,7 @@ def _cos(a, b):
 
 
 def main():
-    p = argparse.ArgumentParser(description="Export WavLM x-vector sang ONNX")
+    p = argparse.ArgumentParser(description="Export the WavLM x-vector to ONNX")
     p.add_argument("--outdir", default="models")
     p.add_argument("--no-int8", action="store_true", dest="no_int8")
     p.add_argument("--opset", type=int, default=17)

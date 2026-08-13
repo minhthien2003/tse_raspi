@@ -1,4 +1,5 @@
-// voice_lock.h — chay V49 ONNX va do muc khoa giong.
+// voice_lock.h - runs the V49 ONNX model and measures how strongly the
+// incoming voice is locked to the enrolled speaker.
 #pragma once
 
 #include <memory>
@@ -20,40 +21,42 @@ struct ChunkStats {
   float     in_db       = -99.0f;
   float     out_db      = -99.0f;
   float     suppress_db = 0.0f;
-  float     mask        = 0.0f;   // mask model tao ra, TRUOC khi mu power
+  float     mask        = 0.0f;   // mask the model produced, BEFORE power
   double    ms          = 0.0;
 };
 
-// Doc mask trung binh: tach bach "loi tinh chinh" voi "loi embedding".
+// Interprets the mean mask: separates "needs tuning" from "bad embedding".
 const char* MaskVerdict(float mask);
 
-// Chuan hoa am luong file dau ra. Chi ap MOT he so cho ca tin hieu — chuan
-// hoa theo tung chunk se keo doan REJECT len ngang LOCKED, pha huy chinh
-// tac dung voice lock. Luon goi SAU khi da do suppress.
+// Normalizes output loudness. Applies ONE gain to the whole signal - a
+// per-chunk normalizer would lift REJECT segments up to LOCKED level and
+// destroy the very effect voice lock provides. Always call AFTER suppression
+// has been measured.
 void NormalizePeak(std::vector<float>* audio, float target_peak = 0.95f);
 
-// Tim file trong cac vi tri thong thuong: nguyen van, roi models/ o thu muc
-// hien tai, cha, va ong. Cho phep chay binary tu tse_cpp/build/ ma van thay
-// models/ o goc project.
-// Tra ve chuoi rong neu khong tim thay o dau.
+// Looks for a file in the usual places: verbatim first, then models/ in the
+// current directory, its parent, and its grandparent. This lets the binary
+// run from tse_cpp/build/ and still find models/ at the project root.
+// Returns an empty string when nothing matches.
 std::string ResolvePath(const std::string& path);
 
 struct Options {
   std::string model      = "v49_int8.onnx";
   std::string emb        = "speaker_emb.npy";
   float       power      = 2.0f;     // mask sharpening
-  float       gain_db    = 2.0f;     // bu gain dau ra
+  float       gain_db    = 2.0f;     // output gain compensation
   float       lock_db    = kDefaultLockDb;
   int         threads    = 4;
-  bool        norm_peak  = false;   // --norm peak
+  bool        norm_peak  = false;    // --norm peak
 };
 
 class VoiceLock {
  public:
   VoiceLock(const Options& opt, const std::vector<float>& embedding);
 
-  // Chay mot chunk. `in` dai bat ky; ben trong se pad/cat cho khop
-  // chunk_samples() vi model export co shape tinh. `out` co cung do dai `in`.
+  // Processes one chunk. `in` may be any length; internally it is padded or
+  // truncated to chunk_samples() because the exported model has a static
+  // shape. `out` ends up the same length as `in`.
   ChunkStats Process(const float* in, int len, std::vector<float>* out);
 
   int   chunk_samples() const { return chunk_samples_; }
@@ -92,7 +95,7 @@ class VoiceLock {
   std::vector<float> spk_emb_;
   std::vector<float> fade_;
 
-  // Bo dem tai su dung — tranh cap phat trong vong lap realtime
+  // Reused buffers - avoids allocating inside the realtime loop
   std::vector<float> scratch_in_;
   std::vector<float> scratch_norm_;
 
@@ -100,7 +103,7 @@ class VoiceLock {
   double total_ms_  = 0.0;
 };
 
-// Doc embedding tu .npy, kiem tra 512-d va L2-normalize.
+// Loads an embedding from .npy, checks it is 512-d, and L2-normalizes it.
 std::vector<float> LoadEmbedding(const std::string& path);
 
 }  // namespace tse

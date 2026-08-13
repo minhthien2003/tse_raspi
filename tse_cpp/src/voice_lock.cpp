@@ -20,10 +20,10 @@ const char* ToString(LockState s) {
 }
 
 const char* MaskVerdict(float m) {
-  if (m > 0.80f) return "tot — model tu tin day la giong dich";
-  if (m > 0.65f) return "kha";
-  if (m > 0.45f) return "yeu — nghi ngo embedding khong khop";
-  return "rat yeu — model khong nhan ra giong nay";
+  if (m > 0.80f) return "good - model is confident this is the target";
+  if (m > 0.65f) return "fair";
+  if (m > 0.45f) return "weak - suspect the embedding does not match";
+  return "very weak - model does not recognize this voice";
 }
 
 void NormalizePeak(std::vector<float>* audio, float target_peak) {
@@ -37,13 +37,13 @@ void NormalizePeak(std::vector<float>* audio, float target_peak) {
 }
 
 // ===========================================================================
-// Tim file
+// File lookup
 // ===========================================================================
 
 std::string ResolvePath(const std::string& path) {
   if (path.empty()) return "";
 
-  // Duong dan tuyet doi thi khong doan them
+  // Do not second-guess an absolute path
   const bool absolute = path[0] == '/' ||
                         (path.size() > 1 && path[1] == ':');
 
@@ -55,7 +55,7 @@ std::string ResolvePath(const std::string& path) {
   if (exists(path)) return path;
   if (absolute) return "";
 
-  // Chi lay ten file de ghep voi cac thu muc models/
+  // Keep only the base name when probing the models/ directories
   std::string base = path;
   const size_t slash = base.find_last_of("/\\");
   if (slash != std::string::npos) base = base.substr(slash + 1);
@@ -80,9 +80,9 @@ std::string MustResolve(const std::string& path, const char* what) {
 
   if (found.empty()) {
     throw std::runtime_error(
-        std::string("Khong tim thay ") + what + ": " + path +
-        "\n  Da tim o: ./ , models/ , ../models/ , ../../models/"
-        "\n  Chi ro bang duong dan tuyet doi neu de o cho khac.");
+        std::string("Cannot find ") + what + ": " + path +
+        "\n  Searched: ./ , models/ , ../models/ , ../../models/"
+        "\n  Pass an absolute path if it lives somewhere else.");
   }
 
   return found;
@@ -99,8 +99,8 @@ std::vector<float> LoadEmbedding(const std::string& path) {
 
   if (static_cast<int>(e.size()) != kSpkDim) {
     throw std::runtime_error(
-        "Embedding phai la " + std::to_string(kSpkDim) + "-d, file co " +
-        std::to_string(e.size()) + " phan tu: " + path);
+        "Embedding must be " + std::to_string(kSpkDim) + "-d, file holds " +
+        std::to_string(e.size()) + " values: " + path);
   }
 
   double norm = 0.0;
@@ -122,16 +122,16 @@ VoiceLock::VoiceLock(const Options& opt, const std::vector<float>& embedding)
       mem_info_(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)),
       spk_emb_(embedding) {
   if (static_cast<int>(spk_emb_.size()) != kSpkDim) {
-    throw std::runtime_error("Embedding khong phai 512-d");
+    throw std::runtime_error("Embedding is not 512-d");
   }
 
   out_gain_ = std::pow(10.0f, opt_.gain_db / 20.0f);
 
   sess_opt_.SetIntraOpNumThreads(opt_.threads);
-  sess_opt_.SetInterOpNumThreads(1);   // Pi 5 chi 4 core, tranh oversubscribe
+  sess_opt_.SetInterOpNumThreads(1);   // Pi 5 has 4 cores, avoid oversubscribing
   sess_opt_.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 
-  const std::string model = MustResolve(opt_.model, "model ONNX");
+  const std::string model = MustResolve(opt_.model, "ONNX model");
   if (model != opt_.model) std::printf("  -> %s\n", model.c_str());
 
   session_ = std::make_unique<Ort::Session>(env_, model.c_str(), sess_opt_);
@@ -163,13 +163,13 @@ void VoiceLock::InspectIo() {
       std::string got;
       for (const auto& s : in_names_) got += s + " ";
       throw std::runtime_error(
-          std::string("Model khong dung interface V49. Thieu input '") + r +
-          "'.\n  Can : inp spk_emb mr mi mm\n  Thay: " + got);
+          std::string("Model does not match the V49 interface. Missing input '")
+          + r + "'.\n  Expected: inp spk_emb mr mi mm\n  Found   : " + got);
     }
   }
 
-  // Model export khong co dynamic_axes -> truc thoi gian co dinh.
-  // Lay T tu graph thay vi hardcode, phong khi sau nay re-export.
+  // The export has no dynamic_axes, so the time axis is fixed. Read T from
+  // the graph instead of hardcoding it, in case the model is re-exported.
   const size_t mr_idx = static_cast<size_t>(
       std::find(in_names_.begin(), in_names_.end(), "mr") - in_names_.begin());
 
@@ -193,7 +193,7 @@ void VoiceLock::InspectIo() {
 
   std::printf("  input T     : %lld frames (%s)\n",
               static_cast<long long>(t_dim),
-              fixed_shape_ ? "co dinh" : "dong");
+              fixed_shape_ ? "fixed" : "dynamic");
   std::printf("  chunk       : %.2f s (%d samples), hop %.2f s\n",
               chunk_sec(), chunk_samples_,
               static_cast<double>(hop_samples_) / kSampleRate);
@@ -229,22 +229,23 @@ ChunkStats VoiceLock::Process(const float* in, int len,
 
   const auto t0 = std::chrono::steady_clock::now();
 
-  // Model co shape tinh -> ep ve dung chunk_samples_
+  // The model has a static shape, so force the input to chunk_samples_
   std::fill(scratch_in_.begin(), scratch_in_.end(), 0.0f);
   const int n = std::min(len, chunk_samples_);
 
-  // Chuan hoa muc vao ve ~ -20 dB RMS cho khop domain LibriMix
+  // Bring the input to ~ -20 dB RMS to match the LibriMix training domain
   const float gain_in = 0.1f / in_rms;
   for (int i = 0; i < n; ++i) scratch_in_[i] = in[i] * gain_in;
 
-  // KHONG dat const: CreateTensor can float* khong hang, va de const thi
-  // phai copy ca ba mang 96632 phan tu moi chunk (~1.1 MB cap phat vo ich).
+  // Deliberately NOT const: CreateTensor wants a non-const float*, and
+  // making this const would force copying all three 96632-element arrays
+  // every chunk (~1.1 MB of pointless allocation).
   Spectrogram s = stft_.Forward(scratch_in_.data(), chunk_samples_);
 
   if (s.frames != frames_) {
     throw std::runtime_error(
-        "So frame STFT (" + std::to_string(s.frames) + ") khong khop model (" +
-        std::to_string(frames_) + ")");
+        "STFT frame count (" + std::to_string(s.frames) +
+        ") does not match the model (" + std::to_string(frames_) + ")");
   }
 
   NormalizeInput(s.mag, scratch_norm_);
@@ -253,7 +254,7 @@ ChunkStats VoiceLock::Process(const float* in, int len,
   const size_t  count   = static_cast<size_t>(kNFreq) * s.frames;
   const int64_t emb_dims[2] = {1, kSpkDim};
 
-  // Tensor tro thang vao bo dem cua ta — ORT khong copy.
+  // Tensors point straight at our buffers - ORT does not copy them.
   auto tensor = [&](std::vector<float>& v) {
     return Ort::Value::CreateTensor<float>(mem_info_, v.data(), count, dims, 3);
   };
@@ -289,11 +290,11 @@ ChunkStats VoiceLock::Process(const float* in, int len,
   float* est_r = outputs[0].GetTensorMutableData<float>();
   float* est_i = outputs[1].GetTensorMutableData<float>();
 
-  // Mask hieu dung MA MODEL TAO RA, truoc khi mu len power. Day la chi so
-  // chan doan quan trong nhat, vi suy giam cuoi cung tuan theo:
+  // The mask the MODEL produced, before raising it to `power`. This is the
+  // single most useful diagnostic, because the final attenuation follows:
   //     suppress_dB = 20 * power * log10(mask)
-  // Lay trung binh CO TRONG SO theo bien do: cac bin gan nhu trong co ty le
-  // est/mix vo nghia, trung binh tran se bi chung keo lech.
+  // Take a MAGNITUDE-WEIGHTED mean: near-empty bins have a meaningless
+  // est/mix ratio and would drag a flat average around.
   double mask_num = 0.0;   // sum(mm * mask)
   double mask_den = 0.0;   // sum(mm)
 
@@ -334,7 +335,8 @@ ChunkStats VoiceLock::Process(const float* in, int len,
   const float out_rms = Rms(out->data(), len);
   st.out_db = Db(out_rms);
 
-  // Bo out_gain khoi phep do, neu khong --gain se lam lech nguong lock.
+  // Exclude out_gain from the measurement, otherwise --gain shifts the
+  // lock threshold by exactly that many dB.
   st.suppress_db = Db(out_rms / out_gain_) - st.in_db;
   st.state = st.suppress_db > opt_.lock_db ? LockState::kLocked
                                            : LockState::kReject;

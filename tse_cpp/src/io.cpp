@@ -23,14 +23,14 @@ uint16_t ReadU16(const uint8_t* p) {
 
 std::vector<uint8_t> ReadFile(const std::string& path) {
   std::ifstream f(path, std::ios::binary | std::ios::ate);
-  if (!f) throw std::runtime_error("Khong mo duoc file: " + path);
+  if (!f) throw std::runtime_error("Cannot open file: " + path);
 
   const std::streamsize n = f.tellg();
   f.seekg(0);
 
   std::vector<uint8_t> buf(static_cast<size_t>(n));
   if (n > 0 && !f.read(reinterpret_cast<char*>(buf.data()), n)) {
-    throw std::runtime_error("Doc file loi: " + path);
+    throw std::runtime_error("Failed to read file: " + path);
   }
   return buf;
 }
@@ -46,15 +46,15 @@ std::vector<float> ReadWav(const std::string& path, int* sample_rate) {
 
   if (b.size() < 44 || std::memcmp(b.data(), "RIFF", 4) != 0 ||
       std::memcmp(b.data() + 8, "WAVE", 4) != 0) {
-    throw std::runtime_error("Khong phai file WAV: " + path);
+    throw std::runtime_error("Not a WAV file: " + path);
   }
 
   uint16_t format = 0, channels = 0, bits = 0;
   uint32_t rate = 0;
   size_t data_off = 0, data_len = 0;
 
-  // Duyet chunk — khong gia dinh "fmt " va "data" nam ngay dau, vi nhieu
-  // file co chunk LIST/fact chen vao giua.
+  // Walk the chunks rather than assuming "fmt " and "data" come first -
+  // plenty of files carry LIST/fact chunks in between.
   size_t pos = 12;
   while (pos + 8 <= b.size()) {
     const char* id = reinterpret_cast<const char*>(b.data() + pos);
@@ -72,21 +72,22 @@ std::vector<float> ReadWav(const std::string& path, int* sample_rate) {
       data_len = std::min(static_cast<size_t>(size), b.size() - body);
     }
 
-    pos = body + size + (size & 1);   // chunk luon can le chan
+    pos = body + size + (size & 1);   // chunks are always word-aligned
   }
 
   if (data_off == 0 || channels == 0) {
-    throw std::runtime_error("WAV thieu chunk fmt/data: " + path);
+    throw std::runtime_error("WAV is missing its fmt/data chunk: " + path);
   }
   // 1 = PCM, 3 = IEEE float, 0xFFFE = extensible
   if (format != 1 && format != 3 && format != 0xFFFE) {
-    throw std::runtime_error("WAV dung codec nen, chua ho tro: " + path);
+    throw std::runtime_error("WAV uses a compressed codec, unsupported: " +
+                             path);
   }
 
   const int bytes = bits / 8;
   if (bytes < 2 || bytes > 4) {
-    throw std::runtime_error("WAV chi ho tro 16/24/32-bit, file nay " +
-                             std::to_string(bits) + "-bit");
+    throw std::runtime_error("Only 16/24/32-bit WAV is supported, this file "
+                             "is " + std::to_string(bits) + "-bit");
   }
 
   const size_t frame_bytes = static_cast<size_t>(bytes) * channels;
@@ -125,7 +126,7 @@ std::vector<float> ReadWav(const std::string& path, int* sample_rate) {
 void WriteWav(const std::string& path, const std::vector<float>& samples,
               int sample_rate) {
   std::ofstream f(path, std::ios::binary);
-  if (!f) throw std::runtime_error("Khong ghi duoc file: " + path);
+  if (!f) throw std::runtime_error("Cannot write file: " + path);
 
   const uint32_t n = static_cast<uint32_t>(samples.size());
   const uint32_t data_bytes = n * 2;
@@ -170,7 +171,7 @@ std::vector<float> ReadNpyFloat32(const std::string& path) {
   const std::vector<uint8_t> b = ReadFile(path);
 
   if (b.size() < 10 || std::memcmp(b.data(), "\x93NUMPY", 6) != 0) {
-    throw std::runtime_error("Khong phai file .npy: " + path);
+    throw std::runtime_error("Not a .npy file: " + path);
   }
 
   const uint8_t major = b[6];
@@ -185,7 +186,7 @@ std::vector<float> ReadNpyFloat32(const std::string& path) {
   }
 
   if (header_off + header_len > b.size()) {
-    throw std::runtime_error("Header .npy hong: " + path);
+    throw std::runtime_error("Corrupt .npy header: " + path);
   }
 
   const std::string header(reinterpret_cast<const char*>(b.data() + header_off),
@@ -194,12 +195,12 @@ std::vector<float> ReadNpyFloat32(const std::string& path) {
   if (header.find("'<f4'") == std::string::npos &&
       header.find("\"<f4\"") == std::string::npos) {
     throw std::runtime_error(
-        "File .npy phai la float32 ('<f4'). Sua o Python:\n"
+        "The .npy file must be float32 ('<f4'). Fix it in Python:\n"
         "    np.save(path, emb.astype(np.float32))\n"
         "  header: " + header);
   }
   if (header.find("'fortran_order': True") != std::string::npos) {
-    throw std::runtime_error("Khong ho tro .npy fortran_order: " + path);
+    throw std::runtime_error("Fortran-ordered .npy is not supported: " + path);
   }
 
   const size_t data_off = header_off + header_len;
@@ -213,12 +214,13 @@ std::vector<float> ReadNpyFloat32(const std::string& path) {
 
 void WriteNpyFloat32(const std::string& path, const std::vector<float>& data) {
   std::ofstream f(path, std::ios::binary);
-  if (!f) throw std::runtime_error("Khong ghi duoc file: " + path);
+  if (!f) throw std::runtime_error("Cannot write file: " + path);
 
   std::string dict = "{'descr': '<f4', 'fortran_order': False, 'shape': (" +
                      std::to_string(data.size()) + ",), }";
 
-  // Numpy yeu cau (10 + len(dict)) chia het cho 64, ket thuc bang '\n'.
+  // Numpy requires (10 + len(dict)) to be a multiple of 64 and the header
+  // to end with '\n'.
   size_t total = 10 + dict.size() + 1;
   const size_t pad = (64 - (total % 64)) % 64;
   dict.append(pad, ' ');

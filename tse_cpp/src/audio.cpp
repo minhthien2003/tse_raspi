@@ -13,7 +13,8 @@ namespace {
 
 snd_pcm_t* H(void* p) { return static_cast<snd_pcm_t*>(p); }
 
-// ALSA in thang loi ra stderr. Khi dang do thiet bi thi tat di cho do roi.
+// ALSA prints errors straight to stderr. Silence it while probing devices,
+// otherwise the output is full of noise from the attempts that fail.
 void SilentHandler(const char*, int, const char*, int, const char*, ...) {}
 
 struct QuietAlsa {
@@ -21,7 +22,7 @@ struct QuietAlsa {
   ~QuietAlsa() { snd_lib_error_set_handler(nullptr); }
 };
 
-// Mo PCM, tra ve nullptr neu that bai (khong nem exception).
+// Opens a PCM device, returning nullptr on failure (never throws).
 snd_pcm_t* TryOpen(const std::string& name, int sample_rate, int period,
                    bool capture) {
   snd_pcm_t* pcm = nullptr;
@@ -46,8 +47,9 @@ snd_pcm_t* TryOpen(const std::string& name, int sample_rate, int period,
   return pcm;
 }
 
-// Duyet cac card tim thiet bi dung duoc. Uu tien plughw: de ALSA tu
-// convert sample rate/format — nhieu mic USB khong chay 16 kHz native.
+// Walks the cards looking for one that works. plughw: is preferred so ALSA
+// converts sample rate and format for us - many USB mics cannot do 16 kHz
+// natively.
 std::string FindWorkingDevice(int sample_rate, int period, bool capture) {
   QuietAlsa quiet;
 
@@ -71,12 +73,13 @@ std::string FindWorkingDevice(int sample_rate, int period, bool capture) {
 AlsaDevice::AlsaDevice(const std::string& device, int sample_rate, int period,
                        bool capture)
     : capture_(capture) {
-  const char* what = capture ? "mic" : "loa";
+  const char* what = capture ? "microphone" : "speaker";
 
-  // Buffer = 4 x period: nhan doc/ghi van chay khi CPU dang ban chay model.
+  // Buffer = 4 x period: reads and writes keep flowing while the CPU is
+  // busy running the model.
   snd_pcm_t* pcm = nullptr;
   {
-    QuietAlsa quiet;   // giau loi ALSA o lan thu dau, ta se tu bao sau
+    QuietAlsa quiet;   // hide ALSA's own error on the first attempt
     pcm = TryOpen(device, sample_rate, period, capture);
   }
 
@@ -85,22 +88,22 @@ AlsaDevice::AlsaDevice(const std::string& device, int sample_rate, int period,
     return;
   }
 
-  // 'default' hay hong tren Pi khi asound.conf dinh nghia kieu asym ma
-  // thieu nhanh capture. Tu do card that thay vi bo cuoc.
+  // 'default' is often broken on the Pi when asound.conf declares an asym
+  // device without a capture branch. Probe real cards instead of giving up.
   const std::string fallback = FindWorkingDevice(sample_rate, period, capture);
 
   if (fallback.empty()) {
     throw std::runtime_error(
-        std::string("Khong mo duoc ") + what + " '" + device + "', va khong "
-        "tim thay thiet bi thay the nao.\n"
-        "  Xem danh sach : ./tse_voice_lock devices\n"
+        std::string("Cannot open the ") + what + " '" + device + "', and no "
+        "usable replacement device was found.\n"
+        "  List devices  : ./tse_voice_lock devices\n"
         "                  " + (capture ? "arecord -l" : "aplay -l") + "\n"
-        "  Chi dinh tay  : --" + (capture ? "in" : "out") +
+        "  Set it by hand: --" + (capture ? "in" : "out") +
         "-device plughw:<card>,0\n"
         "\n"
-        "  Neu loi la 'capture slave is not defined' thi ~/.asoundrc hoac\n"
-        "  /etc/asound.conf dang khai bao 'default' kieu asym ma thieu\n"
-        "  nhanh capture. Sua lai cho co ca hai:\n"
+        "  If the error says 'capture slave is not defined', then\n"
+        "  ~/.asoundrc or /etc/asound.conf declares 'default' as an asym\n"
+        "  device without a capture branch. Give it both:\n"
         "      pcm.!default {\n"
         "          type asym\n"
         "          playback.pcm \"plughw:0,0\"\n"
@@ -108,14 +111,14 @@ AlsaDevice::AlsaDevice(const std::string& device, int sample_rate, int period,
         "      }");
   }
 
-  std::printf("  '%s' khong mo duoc cho %s -> dung '%s'\n",
+  std::printf("  '%s' would not open for %s -> using '%s'\n",
               device.c_str(), what, fallback.c_str());
 
   pcm = TryOpen(fallback, sample_rate, period, capture);
 
   if (!pcm) {
-    throw std::runtime_error(std::string("Mat thiet bi '") + fallback +
-                             "' giua chung");
+    throw std::runtime_error(std::string("Lost device '") + fallback +
+                             "' midway");
   }
 
   handle_ = pcm;
@@ -170,8 +173,8 @@ void AlsaDevice::Prefill(int frames) {
 }
 
 void ListDevices() {
-  // Card that — day moi la cai can de go plughw:<card>,0
-  std::printf("Card am thanh:\n\n");
+  // Real cards - this is what you need in order to type plughw:<card>,0
+  std::printf("Sound cards:\n\n");
 
   int card = -1;
   bool any = false;
@@ -183,7 +186,7 @@ void ListDevices() {
     std::printf("  card %d: %s\n", card, name ? name : "?");
     std::printf("           plughw:%d,0", card);
 
-    // Kiem tra thuc te card nay thu / phat duoc khong
+    // Actually try the card so the capabilities shown are real
     {
       QuietAlsa quiet;
       const std::string dev = "plughw:" + std::to_string(card) + ",0";
@@ -191,14 +194,14 @@ void ListDevices() {
       std::string caps;
       if (snd_pcm_t* p = TryOpen(dev, 16000, 4096, true)) {
         snd_pcm_close(p);
-        caps += " THU";
+        caps += " CAPTURE";
       }
       if (snd_pcm_t* p = TryOpen(dev, 16000, 4096, false)) {
         snd_pcm_close(p);
-        caps += " PHAT";
+        caps += " PLAYBACK";
       }
 
-      std::printf("%s\n", caps.empty() ? "  (khong dung duoc o 16 kHz mono)"
+      std::printf("%s\n", caps.empty() ? "  (unusable at 16 kHz mono)"
                                        : ("  ->" + caps).c_str());
     }
 
@@ -206,16 +209,16 @@ void ListDevices() {
     any = true;
   }
 
-  if (!any) std::printf("  (khong thay card nao)\n");
+  if (!any) std::printf("  (no cards found)\n");
 
-  std::printf("\n  Vi du: --in-device plughw:1,0 --out-device plughw:0,0\n");
+  std::printf("\n  Example: --in-device plughw:1,0 --out-device plughw:0,0\n");
 
   std::printf("\n----------------------------------------------------------\n");
-  std::printf("Ten PCM (bao gom ca plugin ao):\n\n");
+  std::printf("PCM names (including virtual plugins):\n\n");
 
   void** hints = nullptr;
   if (snd_device_name_hint(-1, "pcm", &hints) < 0) {
-    std::printf("  (khong doc duoc danh sach)\n");
+    std::printf("  (could not read the device list)\n");
     return;
   }
 
@@ -229,7 +232,7 @@ void ListDevices() {
       std::printf("  %-28s [%s]\n", name, dir);
 
       if (desc) {
-        // DESC hay co nhieu dong, chi lay dong dau cho gon
+        // DESC is often multi-line; keep the first line only
         std::string d(desc);
         const size_t nl = d.find('\n');
         if (nl != std::string::npos) d = d.substr(0, nl);
@@ -244,8 +247,8 @@ void ListDevices() {
 
   snd_device_name_free_hint(hints);
 
-  std::printf("\n  Neu 'default' bao 'capture slave is not defined' thi\n");
-  std::printf("  bo qua no va dung plughw:<card>,0 o tren.\n");
+  std::printf("\n  If 'default' reports 'capture slave is not defined',\n");
+  std::printf("  ignore it and use one of the plughw:<card>,0 names above.\n");
 }
 
 }  // namespace tse

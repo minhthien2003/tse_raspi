@@ -1,7 +1,8 @@
-// core.h — FFT + STFT/iSTFT + tien ich DSP cho V49 voice lock.
+// core.h - FFT + STFT/iSTFT + DSP helpers for V49 voice lock.
 //
-// Khong phu thuoc thu vien ngoai. Moi hang so phai khop chinh xac voi
-// luc training/export cua V49, neu lech thi model chay ra rac.
+// No external dependencies. Every constant here must match the values used
+// during V49 training/export exactly; a mismatch makes the model emit noise
+// without raising any error.
 #pragma once
 
 #include <complex>
@@ -11,7 +12,7 @@
 namespace tse {
 
 // ---------------------------------------------------------------------------
-// Cau hinh — KHOP VOI V49 ONNX EXPORT, khong duoc sua tuy tien
+// Configuration - MATCHES V49 ONNX EXPORT, do not change casually
 // ---------------------------------------------------------------------------
 
 constexpr int   kSampleRate = 16000;
@@ -22,25 +23,25 @@ constexpr float kComp       = 0.3f;
 constexpr float kEps        = 1e-8f;
 constexpr int   kSpkDim     = 512;
 
-// Enrollment: segment 3 s, chong lan 1.5 s.
+// Enrollment: 3 s segments with 1.5 s overlap.
 constexpr int kEnrollSegment = 3 * kSampleRate;
 constexpr int kEnrollHop     = kSampleRate * 3 / 2;
 
-// Nguong mac dinh
+// Defaults
 constexpr float kDefaultLockDb = -8.0f;
 constexpr float kSilenceRms    = 3e-3f;
 
 // ---------------------------------------------------------------------------
-// FFT phuc, radix-2 Cooley-Tukey, tai cho
+// Complex radix-2 Cooley-Tukey FFT, in place
 // ---------------------------------------------------------------------------
 
 class Fft {
  public:
-  // n phai la luy thua cua 2.
+  // n must be a power of two.
   explicit Fft(int n);
 
   void Forward(std::vector<std::complex<float>>& a) const;
-  // Da chia cho n.
+  // Already divided by n.
   void Inverse(std::vector<std::complex<float>>& a) const;
 
   int size() const { return n_; }
@@ -54,8 +55,8 @@ class Fft {
 };
 
 // ---------------------------------------------------------------------------
-// Ket qua STFT. Cac mang luu row-major [freq][frame] -> index f*frames + t,
-// dung y het layout numpy [F, T] ma ONNX mong doi.
+// STFT result. Arrays are row-major [freq][frame] -> index f*frames + t,
+// which is exactly the numpy [F, T] layout the ONNX model expects.
 // ---------------------------------------------------------------------------
 
 struct Spectrogram {
@@ -65,19 +66,19 @@ struct Spectrogram {
   std::vector<float> mag;
 };
 
-// Cua so Hann PERIODIC: 0.5 - 0.5*cos(2*pi*n/N).
-// KHONG phai symmetric (np.hanning) — training dung torch.hann_window.
+// PERIODIC Hann window: 0.5 - 0.5*cos(2*pi*n/N).
+// NOT the symmetric variant (np.hanning) - training used torch.hann_window.
 std::vector<float> HannPeriodic(int n);
 
 class Stft {
  public:
   Stft();
 
-  // center=True, pad reflect kNFft/2 moi ben — giong torch.stft.
+  // center=True with reflect padding of kNFft/2 on each side, like torch.stft.
   Spectrogram Forward(const float* audio, int len) const;
 
-  // Dung lai pho day du tu kNFreq bin (doi xung Hermitian), overlap-add,
-  // chia cho tong binh phuong cua so, roi cat bo phan pad.
+  // Rebuilds the full spectrum from kNFreq bins via Hermitian symmetry,
+  // overlap-adds, divides by the summed squared window, then strips padding.
   void Inverse(const float* real, const float* imag, int frames,
                float* out, int out_len) const;
 
@@ -90,7 +91,7 @@ class Stft {
 };
 
 // ---------------------------------------------------------------------------
-// Tien ich
+// Helpers
 // ---------------------------------------------------------------------------
 
 // comp = (mag+eps)^0.3 ; out = (comp - mean) / max(std, 1e-3)
@@ -99,7 +100,7 @@ void NormalizeInput(const std::vector<float>& mag, std::vector<float>& out);
 float Rms(const float* x, int n);
 float Db(float x);
 
-// Chuan hoa mean/var cho WavLM (giong Wav2Vec2FeatureExtractor).
+// Mean/variance normalization for WavLM (matches Wav2Vec2FeatureExtractor).
 void NormalizeMeanVar(const float* in, int n, std::vector<float>& out);
 
 }  // namespace tse

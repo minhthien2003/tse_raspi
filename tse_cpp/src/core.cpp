@@ -16,10 +16,10 @@ constexpr double kPi = 3.14159265358979323846;
 
 Fft::Fft(int n) : n_(n) {
   if (n <= 0 || (n & (n - 1)) != 0) {
-    throw std::invalid_argument("Fft: kich thuoc phai la luy thua cua 2");
+    throw std::invalid_argument("Fft: size must be a power of two");
   }
 
-  // Bang bit-reverse
+  // Bit-reversal table
   rev_.resize(n);
   int bits = 0;
   while ((1 << bits) < n) ++bits;
@@ -32,7 +32,8 @@ Fft::Fft(int n) : n_(n) {
     rev_[i] = r;
   }
 
-  // Twiddle exp(-2*pi*i*j/n) — tinh o double roi ha xuong float de bot sai so
+  // Twiddles exp(-2*pi*i*j/n) - computed in double, stored as float to
+  // keep the rounding error down.
   tw_.resize(n / 2);
   for (int j = 0; j < n / 2; ++j) {
     double a = -2.0 * kPi * j / n;
@@ -43,7 +44,7 @@ Fft::Fft(int n) : n_(n) {
 
 void Fft::Transform(std::vector<std::complex<float>>& a, bool inverse) const {
   if (static_cast<int>(a.size()) != n_) {
-    throw std::invalid_argument("Fft: do dai dau vao khong khop");
+    throw std::invalid_argument("Fft: input length mismatch");
   }
 
   for (int i = 0; i < n_; ++i) {
@@ -81,7 +82,7 @@ void Fft::Inverse(std::vector<std::complex<float>>& a) const {
 }
 
 // ===========================================================================
-// Cua so
+// Window
 // ===========================================================================
 
 std::vector<float> HannPeriodic(int n) {
@@ -101,20 +102,20 @@ Stft::Stft() : fft_(kNFft), win_(HannPeriodic(kNFft)), win_sq_(kNFft) {
 }
 
 int Stft::FramesFor(int len) const {
-  const int padded = len + kNFft;          // pad kNFft/2 moi ben
+  const int padded = len + kNFft;          // kNFft/2 padding on each side
   return 1 + (padded - kNFft) / kHop;
 }
 
 namespace {
 
-// np.pad(x, (p, p), mode="reflect"): padded[i] = x[p-i] cho i<p,
-// padded[p+n+j] = x[n-2-j] cho j<p. Yeu cau n >= p+1.
+// np.pad(x, (p, p), mode="reflect"): padded[i] = x[p-i] for i<p, and
+// padded[p+n+j] = x[n-2-j] for j<p. Requires n >= p+1.
 std::vector<float> ReflectPad(const float* x, int n, int p) {
   std::vector<float> out(static_cast<size_t>(n) + 2 * p);
 
   for (int i = 0; i < p; ++i) {
     int src = p - i;
-    if (src >= n) src = n > 0 ? n - 1 : 0;      // audio ngan bat thuong
+    if (src >= n) src = n > 0 ? n - 1 : 0;      // unusually short audio
     out[i] = x[src];
   }
 
@@ -179,12 +180,12 @@ void Stft::Inverse(const float* real, const float* imag, int frames,
   std::vector<std::complex<float>> buf(kNFft);
 
   for (int t = 0; t < frames; ++t) {
-    // Nua duoi tu model
+    // Lower half comes from the model
     for (int f = 0; f < kNFreq; ++f) {
       const size_t idx = static_cast<size_t>(f) * frames + t;
       buf[f] = std::complex<float>(real[idx], imag[idx]);
     }
-    // Nua tren suy ra bang doi xung Hermitian: X[N-k] = conj(X[k])
+    // Upper half follows from Hermitian symmetry: X[N-k] = conj(X[k])
     for (int f = kNFreq; f < kNFft; ++f) {
       buf[f] = std::conj(buf[kNFft - f]);
     }
@@ -207,14 +208,15 @@ void Stft::Inverse(const float* real, const float* imag, int frames,
 }
 
 // ===========================================================================
-// Tien ich
+// Helpers
 // ===========================================================================
 
 void NormalizeInput(const std::vector<float>& mag, std::vector<float>& out) {
   const size_t n = mag.size();
   out.resize(n);
 
-  // Tich luy o double: 96k phan tu, cong don float se troi
+  // Accumulate in double: with 96632 elements a float32 sum drifts enough
+  // to shift the mean and std.
   double sum = 0.0;
   for (size_t i = 0; i < n; ++i) {
     out[i] = std::pow(mag[i] + kEps, kComp);
@@ -259,8 +261,8 @@ void NormalizeMeanVar(const float* in, int n, std::vector<float>& out) {
     const double d = in[i] - mean;
     var += d * d;
   }
-  // ddof=0 — khop voi np.var cua ban Python va cua
-  // Wav2Vec2FeatureExtractor.zero_mean_unit_var_norm trong HuggingFace.
+  // ddof=0 - matches np.var in the Python port and HuggingFace's
+  // Wav2Vec2FeatureExtractor.zero_mean_unit_var_norm.
   var /= n;
 
   const float inv = static_cast<float>(1.0 / std::sqrt(var + 1e-7));

@@ -1,5 +1,5 @@
-// enroll.h — tao speaker embedding 512-d bang WavLM da export ONNX.
-// Khong can PyTorch tren thiet bi.
+// enroll.h - builds a 512-d speaker embedding using WavLM exported to ONNX.
+// No PyTorch is needed on the device.
 #pragma once
 
 #include <string>
@@ -8,13 +8,13 @@
 namespace tse {
 
 struct EnrollResult {
-  std::vector<float> embedding;    // 512-d, da L2-normalize
+  std::vector<float> embedding;      // 512-d, L2-normalized
   int                segments = 0;
-  float              consistency = 0.0f;   // cosine trung binh giua cac segment
+  float              consistency = 0.0f;   // mean cosine across segments
 };
 
-// `encoder_path` la wavlm_sv_int8.onnx / wavlm_sv_fp32.onnx,
-// tao bang export_wavlm_onnx.py tren laptop.
+// `encoder_path` points at wavlm_sv_int8.onnx / wavlm_sv_fp32.onnx, produced
+// by export_wavlm_onnx.py on a laptop.
 EnrollResult ComputeEmbedding(const std::string& encoder_path,
                               const std::vector<float>& audio, int threads);
 

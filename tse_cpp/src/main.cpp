@@ -1,7 +1,7 @@
-// main.cpp — CLI cho V49 voice lock, ban C++.
+// main.cpp - CLI for the V49 voice lock, C++ build.
 //
-// Cac mode giu nguyen ten va y nghia nhu ban Python (voice_lock.py) de
-// hai ban co the doi chieu truc tiep voi nhau.
+// The modes keep the same names and meanings as the Python port
+// (voice_lock.py) so the two can be compared directly against each other.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -31,7 +31,7 @@ std::atomic<bool> g_stop{false};
 void OnSigint(int) { g_stop = true; }
 
 // ---------------------------------------------------------------------------
-// Phan tich tham so
+// Argument parsing
 // ---------------------------------------------------------------------------
 
 struct Args {
@@ -47,19 +47,19 @@ struct Args {
   float seconds = 10.0f;
   int   iters   = 20;
 
-  std::string config_used;   // file config da nap, de in ra cho biet
+  std::string config_used;   // config file that was loaded, for reporting
 };
 
 [[noreturn]] void Die(const std::string& msg) {
-  std::fprintf(stderr, "\nLOI: %s\n", msg.c_str());
+  std::fprintf(stderr, "\nERROR: %s\n", msg.c_str());
   std::exit(1);
 }
 
 // ---------------------------------------------------------------------------
-// File config
+// Config file
 //
-// Dang key = value, '#' la ghi chu. Ap TRUOC khi doc argv de tham so dong
-// lenh luon thang file config.
+// Format is key = value with '#' comments. Applied BEFORE argv is read, so
+// command line arguments always win over the file.
 // ---------------------------------------------------------------------------
 
 const char* kConfigKeys[] = {
@@ -87,19 +87,19 @@ void ApplyOption(const std::string& key, const std::string& value, Args& a,
   else if (key == "iters")      a.iters       = std::atoi(value.c_str());
   else if (key == "norm") {
     if (value != "off" && value != "peak") {
-      Die(std::string(origin) + ": norm chi nhan 'off' hoac 'peak', thay '" +
+      Die(std::string(origin) + ": norm accepts only 'off' or 'peak', got '" +
           value + "'");
     }
     a.opt.norm_peak = value == "peak";
   }
   else {
-    // Go sai ten key ma bo qua im lang la cai bay: nguoi dung tuong da
-    // doi cau hinh nhung thuc te khong.
+    // Silently ignoring a misspelled key is a trap: you think you changed
+    // the configuration when nothing actually changed.
     std::string valid;
     for (const char* k : kConfigKeys) valid += std::string("  ") + k + "\n";
 
-    Die(std::string("Key khong hop le trong ") + origin + ": '" + key +
-        "'\n  Key hop le:\n" + valid);
+    Die(std::string("Invalid key in ") + origin + ": '" + key +
+        "'\n  Valid keys:\n" + valid);
   }
 }
 
@@ -109,7 +109,7 @@ std::string Trim(const std::string& s) {
   return s.substr(b, s.find_last_not_of(" \t\r\n") - b + 1);
 }
 
-// Tra ve duong dan da dung, hoac chuoi rong neu khong co file nao.
+// Returns the path that was used, or an empty string when no file was found.
 std::string LoadConfig(const std::string& path, Args& a) {
   const std::string found = ResolvePath(path);
   if (found.empty()) return "";
@@ -132,18 +132,18 @@ std::string LoadConfig(const std::string& path, Args& a) {
     const size_t eq = line.find('=');
     if (eq == std::string::npos) {
       Die(found + ":" + std::to_string(lineno) +
-          ": thieu dau '=' o dong: " + line);
+          ": missing '=' on line: " + line);
     }
 
     std::string key = Trim(line.substr(0, eq));
     const std::string value = Trim(line.substr(eq + 1));
 
-    // Chap nhan ca 'lock-db' lan 'lock_db'
+    // Accept both 'lock-db' and 'lock_db'
     std::replace(key.begin(), key.end(), '-', '_');
 
-    if (value.empty()) continue;   // key co ma bo trong = giu mac dinh
+    if (value.empty()) continue;   // key present but blank = keep the default
 
-    ApplyOption(key, value,  a,
+    ApplyOption(key, value, a,
                 (found + ":" + std::to_string(lineno)).c_str());
   }
 
@@ -151,46 +151,46 @@ std::string LoadConfig(const std::string& path, Args& a) {
 }
 
 void Usage() {
-  std::printf(R"(V49 VOICE LOCK — ban C++ cho Raspberry Pi 5
+  std::printf(R"(V49 VOICE LOCK - C++ build for Raspberry Pi 5
 
-  tse_voice_lock <mode> [tham so]
+  tse_voice_lock <mode> [options]
 
-Mode:
-  enroll    tao speaker embedding tu mic hoac file wav
-  bench     do latency / RTF
-  file      tach giong tu file wav
-  verify    A/B giong dung vs giong sai
-  live      realtime qua mic (deo tai nghe)
-  devices   liet ke thiet bi ALSA
-  selftest  kiem tra STFT/iSTFT, khong can model
+Modes:
+  enroll    build a speaker embedding from the mic or a wav file
+  bench     measure latency / RTF
+  file      extract the target voice from a wav file
+  verify    A/B the correct voice against a different one
+  live      realtime through the mic (WEAR HEADPHONES)
+  devices   list ALSA devices
+  selftest  check STFT/iSTFT, no model required
 
-Tham so chung:
-  --config PATH     file config (mac dinh tu tim voice_lock.conf)
-  --no-config       bo qua file config, chi dung mac dinh + dong lenh
-  --model PATH      mac dinh v49_int8.onnx (tu tim trong models/)
-  --emb PATH        mac dinh speaker_emb.npy
-  --power N         mask sharpening (1=tat, 2=mac dinh, 3=manh)
-  --gain N          gain dau ra dB
-  --lock-db N       nguong LOCKED (mac dinh -8)
-  --threads N       so thread ONNX (mac dinh 4)
-  --norm off|peak   chuan hoa am luong FILE dau ra len peak 0.95.
-                    Ap sau khi do xong nen khong lam lech so do suppress.
+Common options:
+  --config PATH     config file (voice_lock.conf is found automatically)
+  --no-config       skip the config file, use defaults plus command line
+  --model PATH      defaults to v49_int8.onnx (searched under models/)
+  --emb PATH        defaults to speaker_emb.npy
+  --power N         mask sharpening (1=off, 2=default, 3=strong)
+  --gain N          output gain in dB
+  --lock-db N       LOCKED threshold (default -8)
+  --threads N       ONNX thread count (default 4)
+  --norm off|peak   normalize the OUTPUT FILE to peak 0.95. Applied after
+                    measurement, so it does not skew the suppression figures.
 
-Rieng tung mode:
+Per mode:
   enroll   --encoder PATH  --seconds N  --wav PATH  --out-wav PATH
   bench    --iters N
   file     -i PATH  -o PATH
   verify   --emb-target PATH  --emb-other PATH  -i PATH
   live     --save PREFIX  --in-device NAME  --out-device NAME
 
-Cau hinh:
-  Dat cac gia tri hay dung vao voice_lock.conf roi khoi go moi lan.
-  Thu tu uu tien: mac dinh < voice_lock.conf < tham so dong lenh.
+Configuration:
+  Put the values you use often into voice_lock.conf and stop typing them.
+  Precedence: defaults < voice_lock.conf < command line.
 
-Vi du:
-  tse_voice_lock live                    # lay het tu voice_lock.conf
-  tse_voice_lock live --power 4          # nhu tren nhung ghi de power
-  tse_voice_lock bench --no-config       # bo qua config
+Examples:
+  tse_voice_lock live                    # everything from voice_lock.conf
+  tse_voice_lock live --power 4          # same, but override power
+  tse_voice_lock bench --no-config       # ignore the config file
 )");
 }
 
@@ -204,11 +204,11 @@ Args Parse(int argc, char** argv) {
   a.cmd = argv[1];
 
   auto need = [&](int i) -> const char* {
-    if (i + 1 >= argc) Die(std::string("Thieu gia tri cho ") + argv[i]);
+    if (i + 1 >= argc) Die(std::string("Missing value for ") + argv[i]);
     return argv[i + 1];
   };
 
-  // --- Luot 1: chi tim --config / --no-config -----------------------------
+  // --- Pass 1: look only for --config / --no-config ------------------------
   std::string config_path = "voice_lock.conf";
   bool use_config = true;
 
@@ -228,17 +228,18 @@ Args Parse(int argc, char** argv) {
     if (!loaded.empty()) {
       a.config_used = loaded;
     } else if (config_path != "voice_lock.conf") {
-      // Go --config ro rang ma khong thay file thi phai bao, khong im lang
-      Die("Khong tim thay file config: " + config_path);
+      // An explicit --config that cannot be found must be reported, not
+      // silently ignored.
+      Die("Config file not found: " + config_path);
     }
   }
 
-  // --- Luot 2: tham so dong lenh, ghi de len config -----------------------
+  // --- Pass 2: command line arguments, overriding the config --------------
   for (int i = 2; i < argc; ++i) {
     const std::string k = argv[i];
 
-    if      (k == "--config")     ++i;            // da xu ly o luot 1
-    else if (k == "--no-config")  ;               // da xu ly o luot 1
+    if      (k == "--config")     ++i;            // handled in pass 1
+    else if (k == "--no-config")  ;               // handled in pass 1
     else if (k == "--model")      a.opt.model   = need(i), ++i;
     else if (k == "--emb")        a.opt.emb     = need(i), ++i;
     else if (k == "--power")      a.opt.power   = std::atof(need(i)), ++i;
@@ -248,7 +249,7 @@ Args Parse(int argc, char** argv) {
     else if (k == "--norm") {
       const std::string v = need(i);
       ++i;
-      if (v != "off" && v != "peak") Die("--norm chi nhan 'off' hoac 'peak'");
+      if (v != "off" && v != "peak") Die("--norm accepts only 'off' or 'peak'");
       a.opt.norm_peak = v == "peak";
     }
     else if (k == "--encoder")    a.encoder     = need(i), ++i;
@@ -264,7 +265,7 @@ Args Parse(int argc, char** argv) {
     else if (k == "-i" || k == "--input")  a.input  = need(i), ++i;
     else if (k == "-o" || k == "--output") a.output = need(i), ++i;
     else if (k == "-h" || k == "--help") { Usage(); std::exit(0); }
-    else Die("Tham so la: " + k);
+    else Die("Unknown option: " + k);
   }
 
   if (a.opt.threads < 1) a.opt.threads = 1;
@@ -273,7 +274,7 @@ Args Parse(int argc, char** argv) {
 }
 
 // ---------------------------------------------------------------------------
-// Tien ich chung
+// Shared helpers
 // ---------------------------------------------------------------------------
 
 VoiceLock Build(const Args& a) {
@@ -284,6 +285,9 @@ VoiceLock Build(const Args& a) {
   std::printf("  emb   : %s\n", a.opt.emb.c_str());
   std::printf("  power : %.1f   gain : +%.1f dB   lock : %+.1f dB\n",
               a.opt.power, a.opt.gain_db, a.opt.lock_db);
+  if (!a.config_used.empty()) {
+    std::printf("  config: %s\n", a.config_used.c_str());
+  }
 
   return VoiceLock(a.opt, LoadEmbedding(a.opt.emb));
 }
@@ -293,8 +297,9 @@ std::vector<float> LoadAudio16k(const std::string& path) {
   std::vector<float> a = ReadWav(path, &sr);
 
   if (sr != kSampleRate) {
-    Die("File " + path + " la " + std::to_string(sr) + " Hz, model can 16000 Hz.\n"
-        "  Convert: sox in.wav -r 16000 -c 1 out.wav");
+    Die("File " + path + " is " + std::to_string(sr) +
+        " Hz, the model needs 16000 Hz.\n"
+        "  Convert it: sox in.wav -r 16000 -c 1 out.wav");
   }
 
   return a;
@@ -307,46 +312,50 @@ void Summary(const VoiceLock& vl, const std::vector<ChunkStats>& all) {
   }
 
   std::printf("\n==============================================================\n");
-  std::printf("TONG KET\n");
+  std::printf("SUMMARY\n");
   std::printf("==============================================================\n");
 
   if (v.empty()) {
-    std::printf("  Khong co chunk nao co tieng.\n");
+    std::printf("  No chunk contained any sound.\n");
     return;
   }
 
-  double sum = 0.0;
+  double sum = 0.0, mask_sum = 0.0;
   float lo = 1e9f, hi = -1e9f;
   int locked = 0;
 
   for (const auto* s : v) {
     sum += s->suppress_db;
+    mask_sum += s->mask;
     lo = std::min(lo, s->suppress_db);
     hi = std::max(hi, s->suppress_db);
     if (s->state == LockState::kLocked) ++locked;
   }
 
   const double n = static_cast<double>(v.size());
+  const float mask_avg = static_cast<float>(mask_sum / n);
 
-  std::printf("  chunk co tieng : %zu\n", v.size());
-  std::printf("  LOCKED         : %d (%.0f%%)\n", locked, 100.0 * locked / n);
-  std::printf("  REJECT         : %zu\n", v.size() - locked);
-  std::printf("  suppress       : trung binh %+.1f dB, min %+.1f / max %+.1f\n",
+  std::printf("  chunks with sound : %zu\n", v.size());
+  std::printf("  LOCKED            : %d (%.0f%%)\n", locked, 100.0 * locked / n);
+  std::printf("  REJECT            : %zu\n", v.size() - locked);
+  std::printf("  suppression       : mean %+.1f dB, min %+.1f / max %+.1f\n",
               sum / n, lo, hi);
-  std::printf("  latency        : %.0f ms/chunk, RTF %.3f (%s)\n",
+  std::printf("  model mask        : mean %.3f  (%s)\n",
+              mask_avg, MaskVerdict(mask_avg));
+  std::printf("  latency           : %.0f ms/chunk, RTF %.3f (%s)\n",
               vl.total_ms() / std::max(vl.processed(), 1), vl.rtf(),
-              vl.rtf() < 1.0 ? "realtime OK" : "QUA CHAM");
+              vl.rtf() < 1.0 ? "realtime OK" : "TOO SLOW");
 }
 
 // ---------------------------------------------------------------------------
-// selftest — khong can model, dung de doi chieu voi ban Python
+// selftest - no model needed, used to cross-check against the Python port
 // ---------------------------------------------------------------------------
 
 int CmdSelftest() {
-  std::printf("SELFTEST — DSP, khong can model ONNX\n\n");
+  std::printf("SELFTEST - DSP only, no ONNX model required\n\n");
 
-  // Tin hieu tat dinh: sin 440 Hz + sin 1234 Hz. Ban Python phai
-  // sinh y het (xem tools/parity_ref.py).
+  // Deterministic signal: sin 440 Hz + sin 1234 Hz. The Python side must
+  // generate exactly the same thing (see tools/parity_ref.py).
   constexpr double kPi = 3.14159265358979323846;
 
   const int n = 48000;
@@ -360,7 +369,7 @@ int CmdSelftest() {
   Stft stft;
   const Spectrogram s = stft.Forward(x.data(), n);
 
-  std::printf("  frames        : %d  (mong doi 376)\n", s.frames);
+  std::printf("  frames        : %d  (expected 376)\n", s.frames);
 
   std::vector<float> y(n);
   stft.Inverse(s.real.data(), s.imag.data(), s.frames, y.data(), n);
@@ -378,12 +387,14 @@ int CmdSelftest() {
   for (float v : norm) norm_mean += v;
   norm_mean /= norm.size();
 
-  // In du chu so y nghia de tools/parity_ref.py so sanh duoc that su.
+  // Print enough significant digits for tools/parity_ref.py to really
+  // compare.
   //
-  // Bin 14 = 440 Hz (440 / (16000/512) = 14.08) — chon bin CO nang luong.
-  // Bin trong (vd bin 100) chi la san nhieu float32, hai thuat toan FFT
-  // khac nhau se lech ~1e-4 tuong doi o do ma khong co y nghia gi.
-  std::printf("  roundtrip err : %.6e   (can < 1e-5)\n", max_err);
+  // Bin 14 = 440 Hz (440 / (16000/512) = 14.08) - pick a bin that HAS
+  // energy. An empty bin (say bin 100) is just float32 noise floor, where
+  // two different FFT algorithms differ by ~1e-4 relative for no meaningful
+  // reason.
+  std::printf("  roundtrip err : %.6e   (must be < 1e-5)\n", max_err);
   std::printf("  sum(mag)      : %.9g\n", mag_sum);
   std::printf("  mag[14,50]    : %.9g\n",
               s.mag[static_cast<size_t>(14) * s.frames + 50]);
@@ -395,8 +406,9 @@ int CmdSelftest() {
 
   const bool ok = max_err < 1e-5f && s.frames == 376;
 
-  std::printf("\n  %s\n", ok ? "PASS" : "FAIL — DSP lech, khong chay model");
-  std::printf("\n  Doi chieu: python tools/parity_ref.py\n");
+  std::printf("\n  %s\n",
+              ok ? "PASS" : "FAIL - DSP is off, do not run the model");
+  std::printf("\n  Cross-check with: python tools/parity_ref.py\n");
 
   return ok ? 0 : 1;
 }
@@ -407,10 +419,10 @@ int CmdSelftest() {
 
 int CmdEnroll(const Args& a) {
   std::printf("==============================================================\n");
-  std::printf("ENROLLMENT — tao speaker embedding 512-d\n");
+  std::printf("ENROLLMENT - build a 512-d speaker embedding\n");
   std::printf("==============================================================\n");
 
-  // Khong ep phai go --encoder: tu tim trong models/ nhu ban Python.
+  // --encoder is optional: search models/ the same way the Python port does.
   std::string encoder = ResolvePath(a.encoder.empty() ? "wavlm_sv_int8.onnx"
                                                       : a.encoder);
   if (encoder.empty() && a.encoder.empty()) {
@@ -418,22 +430,22 @@ int CmdEnroll(const Args& a) {
   }
 
   if (encoder.empty()) {
-    Die("Khong tim thay WavLM encoder ONNX.\n"
-        "  Da tim: models/wavlm_sv_int8.onnx , models/wavlm_sv_fp32.onnx\n"
-        "  Tao tren laptop: python export_wavlm_onnx.py --outdir models\n"
-        "  Hoac enroll tren laptop roi copy speaker_emb.npy sang day.");
+    Die("No WavLM ONNX encoder found.\n"
+        "  Searched: models/wavlm_sv_int8.onnx , models/wavlm_sv_fp32.onnx\n"
+        "  Build it on a laptop: python export_wavlm_onnx.py --outdir models\n"
+        "  Or enroll on the laptop and copy speaker_emb.npy over.");
   }
 
   std::vector<float> audio;
 
   if (!a.input.empty()) {
     audio = LoadAudio16k(a.input);
-    std::printf("  doc: %s (%.1f s)\n", a.input.c_str(),
+    std::printf("  read: %s (%.1f s)\n", a.input.c_str(),
                 audio.size() / static_cast<double>(kSampleRate));
   } else {
     const int total = static_cast<int>(a.seconds * kSampleRate);
 
-    std::printf("\n  Ghi am %.0f s. Noi tu nhien, thay doi ngu dieu.\n",
+    std::printf("\n  Recording %.0f s. Speak naturally, vary your intonation.\n",
                 a.seconds);
     for (int i = 3; i > 0; --i) {
       std::printf("  %d...\n", i);
@@ -445,10 +457,10 @@ int CmdEnroll(const Args& a) {
     AlsaDevice mic(a.in_device, kSampleRate, 4096, true);
 
     audio.resize(total);
-    if (!mic.Read(audio.data(), total)) Die("Doc mic that bai");
+    if (!mic.Read(audio.data(), total)) Die("Reading from the mic failed");
 
     WriteWav(a.out_wav, audio, kSampleRate);
-    std::printf("  luu: %s\n", a.out_wav.c_str());
+    std::printf("  saved: %s\n", a.out_wav.c_str());
   }
 
   const float r = Rms(audio.data(), static_cast<int>(audio.size()));
@@ -456,19 +468,23 @@ int CmdEnroll(const Args& a) {
   for (float v : audio) peak = std::max(peak, std::fabs(v));
 
   std::printf("  RMS=%.4f  peak=%.4f\n", r, peak);
-  if (r < 0.005f) std::printf("  CANH BAO: qua nho — kiem tra mic (alsamixer)\n");
-  if (peak > 0.95f) std::printf("  CANH BAO: clipping — lui ra xa mic\n");
+  if (r < 0.005f) {
+    std::printf("  WARNING: very quiet - check the mic (alsamixer)\n");
+  }
+  if (peak > 0.95f) {
+    std::printf("  WARNING: clipping - move further from the mic\n");
+  }
 
   const EnrollResult res = ComputeEmbedding(encoder, audio, a.opt.threads);
 
   WriteNpyFloat32(a.opt.emb, res.embedding);
 
   std::printf("\n  embedding: (512,) -> %s\n", a.opt.emb.c_str());
-  std::printf("  %d segment, consistency %.3f (>0.85 tot, <0.7 nhieu)\n",
+  std::printf("  %d segments, consistency %.3f (>0.85 good, <0.7 noisy)\n",
               res.segments, res.consistency);
 
   if (res.consistency < 0.7f) {
-    std::printf("  Nen ghi lai o noi yen tinh hon.\n");
+    std::printf("  Consider re-recording somewhere quieter.\n");
   }
 
   return 0;
@@ -507,21 +523,21 @@ int CmdBench(const Args& a) {
   for (double v : ms) sum += v;
   const double mean = sum / ms.size();
 
-  std::printf("\n  Benchmark (%d lan, chunk %.1f s, %d threads)\n",
+  std::printf("\n  Benchmark (%d runs, %.1f s chunks, %d threads)\n",
               a.iters, vl.chunk_sec(), a.opt.threads);
   std::printf("    mean   : %7.0f ms\n", mean);
   std::printf("    median : %7.0f ms\n", ms[ms.size() / 2]);
   std::printf("    min/max: %.0f / %.0f ms\n", ms.front(), ms.back());
   std::printf("    RTF    : %.3f   %s\n", vl.rtf(),
-              vl.rtf() < 1.0 ? "REALTIME OK" : "QUA CHAM");
+              vl.rtf() < 1.0 ? "REALTIME OK" : "TOO SLOW");
 
   const double budget = vl.hop_samples() * 1000.0 / kSampleRate;
-  std::printf("\n    Ngan sach 1 hop = %.0f ms -> %s\n", budget,
-              mean < budget ? "du" : "THIEU, se drop audio");
+  std::printf("\n    Budget per hop = %.0f ms -> %s\n", budget,
+              mean < budget ? "enough" : "NOT ENOUGH, audio will drop");
 
   if (vl.rtf() >= 1.0) {
-    std::printf("\n  Cach tang toc tren Pi 5:\n");
-    std::printf("    - --power 1 (bo sharpening, ~20%% nhanh hon)\n");
+    std::printf("\n  Ways to speed this up on a Pi 5:\n");
+    std::printf("    - --power 1 (drops sharpening, ~20%% faster)\n");
     std::printf("    - sudo cpufreq-set -g performance\n");
   }
 
@@ -533,7 +549,7 @@ int CmdBench(const Args& a) {
 // ---------------------------------------------------------------------------
 
 int CmdFile(const Args& a) {
-  if (a.input.empty()) Die("Can -i <file.wav>");
+  if (a.input.empty()) Die("-i <file.wav> is required");
 
   VoiceLock vl = Build(a);
 
@@ -551,8 +567,8 @@ int CmdFile(const Args& a) {
 
   std::printf("\n  %s (%.1f s)\n", a.input.c_str(),
               total / static_cast<double>(kSampleRate));
-  std::printf("\n     t (s)    in dB    out dB   suppress      ms  state\n");
-  std::printf("  ----------------------------------------------------------\n");
+  std::printf("\n     t (s)    in dB    out dB   suppress   mask      ms  state\n");
+  std::printf("  ------------------------------------------------------------------\n");
 
   std::vector<ChunkStats> all;
   std::vector<float> chunk_out;
@@ -566,9 +582,9 @@ int CmdFile(const Args& a) {
       weight[start + i] += fade[i];
     }
 
-    std::printf("  %8.1f %8.1f %9.1f %+9.1f dB %6.0f  %s\n",
+    std::printf("  %8.1f %8.1f %9.1f %+9.1f dB %6.3f %6.0f  %s\n",
                 start / static_cast<double>(kSampleRate), st.in_db, st.out_db,
-                st.suppress_db, st.ms, ToString(st.state));
+                st.suppress_db, st.mask, st.ms, ToString(st.state));
   }
 
   float peak = 0.0f;
@@ -577,15 +593,20 @@ int CmdFile(const Args& a) {
     peak = std::max(peak, std::fabs(out[i]));
   }
 
-  if (peak > 1.0f) {
+  if (a.opt.norm_peak) {
+    // One gain for the whole file, applied after suppression was measured,
+    // so the figures stay honest and LOCKED still sits above REJECT.
+    NormalizePeak(&out);
+    std::printf("\n  (--norm peak: %.4f -> 0.9500)\n", peak);
+  } else if (peak > 1.0f) {
     for (float& v : out) v /= peak;
-    std::printf("\n  (chuan hoa lai, peak was %.2f)\n", peak);
+    std::printf("\n  (rescaled to avoid clipping, peak was %.2f)\n", peak);
   }
 
   WriteWav(a.output, out, kSampleRate);
 
   Summary(vl, all);
-  std::printf("\n  Da luu: %s\n", a.output.c_str());
+  std::printf("\n  Saved: %s\n", a.output.c_str());
 
   return 0;
 }
@@ -595,9 +616,9 @@ int CmdFile(const Args& a) {
 // ---------------------------------------------------------------------------
 
 int CmdVerify(const Args& a) {
-  if (a.input.empty()) Die("Can -i <file.wav>");
+  if (a.input.empty()) Die("-i <file.wav> is required");
   if (a.emb_target.empty() || a.emb_other.empty()) {
-    Die("Can --emb-target va --emb-other");
+    Die("--emb-target and --emb-other are required");
   }
 
   const std::vector<float> audio = LoadAudio16k(a.input);
@@ -633,24 +654,26 @@ int CmdVerify(const Args& a) {
     }
 
     result[k] = n ? sum / n : 0.0;
-    std::printf("      suppression trung binh: %+.1f dB\n", result[k]);
+    std::printf("      mean suppression: %+.1f dB\n", result[k]);
   }
 
   const double gap = result[0] - result[1];
 
   std::printf("\n==============================================================\n");
-  std::printf("KET QUA VOICE LOCK\n");
+  std::printf("VOICE LOCK RESULT\n");
   std::printf("==============================================================\n");
-  std::printf("  giong dung (target) : %+6.1f dB  (cang gan 0 cang tot)\n", result[0]);
-  std::printf("  giong sai  (other)  : %+6.1f dB  (cang am cang tot)\n", result[1]);
-  std::printf("  khoang cach         : %+6.1f dB\n", gap);
+  std::printf("  correct voice (target) : %+6.1f dB  (closer to 0 is better)\n",
+              result[0]);
+  std::printf("  wrong voice   (other)  : %+6.1f dB  (more negative is better)\n",
+              result[1]);
+  std::printf("  gap                    : %+6.1f dB\n", gap);
 
   if (gap > 6.0) {
-    std::printf("\n  => LOCK TOT: model phan biet ro theo enrollment.\n");
+    std::printf("\n  => GOOD LOCK: the model clearly follows the enrollment.\n");
   } else if (gap > 3.0) {
-    std::printf("\n  => LOCK YEU: nen enroll lai 10-15 s, tang --power.\n");
+    std::printf("\n  => WEAK LOCK: re-enroll for 10-15 s, raise --power.\n");
   } else {
-    std::printf("\n  => KHONG LOCK: kiem tra lai embedding / file dau vao.\n");
+    std::printf("\n  => NO LOCK: check the embedding and the input file.\n");
   }
 
   return 0;
@@ -670,17 +693,17 @@ int CmdLive(const Args& a) {
   AlsaDevice mic(a.in_device, kSampleRate, hop, true);
   AlsaDevice spk(a.out_device, kSampleRate, hop, false);
 
-  std::printf("\n  chunk %.1f s / hop %.1f s, nguong lock %+.1f dB\n",
+  std::printf("\n  chunk %.1f s / hop %.1f s, lock threshold %+.1f dB\n",
               vl.chunk_sec(), hop / static_cast<double>(kSampleRate),
               a.opt.lock_db);
-  std::printf("  DEO TAI NGHE — dung loa se bi hu (feedback).\n");
+  std::printf("  WEAR HEADPHONES - speakers will cause feedback.\n");
   if (!a.save.empty()) {
-    std::printf("  ghi ra: %s_input.wav / %s_output.wav\n",
+    std::printf("  recording to: %s_input.wav / %s_output.wav\n",
                 a.save.c_str(), a.save.c_str());
   }
-  std::printf("  Ctrl+C de dung.\n\n");
-  std::printf("   chunk    in dB    out dB   suppress      ms    RTF  state\n");
-  std::printf("  --------------------------------------------------------------\n");
+  std::printf("  Ctrl+C to stop.\n\n");
+  std::printf("   chunk    in dB    out dB   suppress   mask      ms    RTF  state\n");
+  std::printf("  ----------------------------------------------------------------------\n");
 
   std::vector<float> in_buf(chunk, 0.0f);
   std::vector<float> out_buf(chunk, 0.0f);
@@ -692,18 +715,18 @@ int CmdLive(const Args& a) {
 
   std::signal(SIGINT, OnSigint);
 
-  // Mo san buffer phat de khoi underrun ngay chunk dau
+  // Prime the playback buffer so the first chunk does not underrun
   spk.Prefill(hop);
 
   while (!g_stop) {
     if (!mic.Read(block.data(), hop)) {
-      std::fprintf(stderr, "\n  Mic dut ket noi.\n");
+      std::fprintf(stderr, "\n  Lost the microphone.\n");
       break;
     }
 
     if (!a.save.empty()) rec_in.insert(rec_in.end(), block.begin(), block.end());
 
-    // Truot cua so vao: bo hop cu nhat, nap hop moi
+    // Slide the input window: drop the oldest hop, append the new one
     std::memmove(in_buf.data(), in_buf.data() + hop,
                  sizeof(float) * (chunk - hop));
     std::memcpy(in_buf.data() + chunk - hop, block.data(), sizeof(float) * hop);
@@ -729,19 +752,20 @@ int CmdLive(const Args& a) {
     std::memset(out_w.data() + chunk - hop, 0, sizeof(float) * hop);
 
     if (!spk.Write(emit.data(), hop)) {
-      std::fprintf(stderr, "\n  Loa dut ket noi.\n");
+      std::fprintf(stderr, "\n  Lost the speaker.\n");
       break;
     }
 
     if (!a.save.empty()) rec_out.insert(rec_out.end(), emit.begin(), emit.end());
 
-    std::printf("  %6d %8.1f %9.1f %+9.1f dB %6.0f %6.3f  %s\n",
-                vl.processed(), st.in_db, st.out_db, st.suppress_db, st.ms,
-                vl.rtf(), ToString(st.state));
+    std::printf("  %6d %8.1f %9.1f %+9.1f dB %6.3f %6.0f %6.3f  %s\n",
+                vl.processed(), st.in_db, st.out_db, st.suppress_db, st.mask,
+                st.ms, vl.rtf(), ToString(st.state));
     std::fflush(stdout);
   }
 
-  std::printf("\n  Dung. xrun: mic %d, loa %d\n", mic.xruns(), spk.xruns());
+  std::printf("\n  Stopped. xruns: mic %d, speaker %d\n",
+              mic.xruns(), spk.xruns());
 
   Summary(vl, all);
 
@@ -751,16 +775,16 @@ int CmdLive(const Args& a) {
     rec_out.resize(n);
 
     if (a.opt.norm_peak) {
-      // Chi chuan hoa file da luu — khong anh huong am thanh phat ra luc
-      // chay, cung khong anh huong so do suppress.
+      // Only the saved file is normalized - this does not change what was
+      // played live, nor the suppression figures.
       NormalizePeak(&rec_out);
-      std::printf("  (--norm peak ap cho file output)\n");
+      std::printf("  (--norm peak applied to the output file)\n");
     }
 
     WriteWav(a.save + "_input.wav", rec_in, kSampleRate);
     WriteWav(a.save + "_output.wav", rec_out, kSampleRate);
 
-    std::printf("\n  Da luu %.1f s:\n", n / static_cast<double>(kSampleRate));
+    std::printf("\n  Saved %.1f s:\n", n / static_cast<double>(kSampleRate));
     std::printf("    %s_input.wav\n", a.save.c_str());
     std::printf("    %s_output.wav\n", a.save.c_str());
   }
@@ -786,10 +810,10 @@ int main(int argc, char** argv) {
     return 1;
 
   } catch (const Ort::Exception& e) {
-    std::fprintf(stderr, "\nLOI ONNX Runtime: %s\n", e.what());
+    std::fprintf(stderr, "\nONNX Runtime error: %s\n", e.what());
     return 1;
   } catch (const std::exception& e) {
-    std::fprintf(stderr, "\nLOI: %s\n", e.what());
+    std::fprintf(stderr, "\nERROR: %s\n", e.what());
     return 1;
   }
 }

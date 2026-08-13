@@ -1,58 +1,59 @@
 #!/usr/bin/env python3
 """
-VOICE LOCK TEST — V49 Target Speaker Extraction on Raspberry Pi 5
+VOICE LOCK TEST - V49 Target Speaker Extraction on Raspberry Pi 5
 ==================================================================
 
-Kiem tra kha nang "khoa giong" (voice lock) cua model V49:
-model chi giu lai giong cua nguoi da enroll, nen giong khac se bi
-suy giam manh. Script do muc suy giam (dB) tren tung chunk va bao
-LOCKED / REJECT theo thoi gian thuc.
+Measures how well V49 "locks" onto a voice: the model keeps the enrolled
+speaker and attenuates everyone else. This script reports the attenuation in
+dB per chunk and calls each one LOCKED or REJECT in real time.
 
-Cai dat tren Pi 5 — KHONG can PyTorch cho bat ky che do nao:
+Install on a Pi 5 - PyTorch is NOT needed for any mode:
     sudo apt install -y libportaudio2
     pip install onnxruntime numpy sounddevice soundfile
 
-Cach dung
----------
-1) Tao enrollment embedding (chi lam 1 lan). Ba lua chon:
+Usage
+-----
+1) Build the enrollment embedding (once). Three options:
 
-   a) Tren Pi 5 voi encoder ONNX — khong can torch (khuyen dung):
-        # tren laptop, 1 lan: python export_wavlm_onnx.py
-        # copy wavlm_sv_int8.onnx sang Pi, roi:
+   a) On the Pi 5 with the ONNX encoder, no torch (recommended):
+        # on a laptop, once: python export_wavlm_onnx.py
+        # copy wavlm_sv_int8.onnx to the Pi, then:
         python voice_lock.py enroll --seconds 10
 
-   b) Tren laptop roi copy file speaker_emb.npy (2 KB) sang Pi.
+   b) Enroll on a laptop and copy speaker_emb.npy (2 KB) over.
 
-   c) Tren Pi voi torch (nang, khong khuyen khich):
+   c) On the Pi with torch (heavy, not recommended):
         pip install torch transformers
         python voice_lock.py enroll --seconds 10
 
-2) Do toc do / RTF trên Pi 5:
-     python voice_lock.py bench --model v49_int8.onnx --emb speaker_emb.npy
+2) Measure speed / RTF on the Pi 5:
+     python voice_lock.py bench
 
-3) Test voice lock realtime qua mic (deo tai nghe de tranh hu):
-     python voice_lock.py live --model v49_int8.onnx --emb speaker_emb.npy \
-         --power 3 --gain 3 --save demo1
+3) Realtime test through the mic (WEAR HEADPHONES to avoid feedback):
+     python voice_lock.py live --power 3 --gain 3 --save demo1
 
-4) Test voice lock tren file wav san co:
-     python voice_lock.py file --model v49_int8.onnx --emb speaker_emb.npy \
-         -i mixed.wav -o extracted.wav
+4) Run the extraction over an existing wav file:
+     python voice_lock.py file -i mixed.wav -o extracted.wav
 
-5) Kiem tra A/B (giong dung vs giong sai) tren 2 file:
-     python voice_lock.py verify --model v49_int8.onnx \
-         --emb-target target_emb.npy --emb-other other_emb.npy -i mixed.wav
+5) A/B the correct voice against a different one:
+     python voice_lock.py verify --emb-target target.npy \
+         --emb-other other.npy -i mixed.wav
 
-Tham so tinh chinh:
-    --power N   sharpening mask (1 = tat, 2 = mac dinh, 3 = manh)
-    --gain N    bu gain dau ra theo dB (0-4)
-    --lock-db N nguong quyet dinh LOCKED (mac dinh -8 dB)
+6) Diagnose the embedding itself:
+     python voice_lock.py inspect
 
-ONNX interface (5 in / 2 out), STFT & iSTFT chay o host:
-    inp     [1,257,T] magnitude nen + chuan hoa
+Tuning knobs:
+    --power N   mask sharpening (1 = off, 2 = default, 3 = strong)
+    --gain N    output make-up gain in dB (0-4)
+    --lock-db N LOCKED decision threshold (default -8 dB)
+    --norm peak normalize the output FILE to peak 0.95
+
+ONNX interface (5 in / 2 out); STFT and iSTFT run on the host:
+    inp     [1,257,T] compressed, normalized magnitude
     spk_emb [1,512]   WavLM speaker embedding
     mr/mi/mm[1,257,T] STFT real / imag / magnitude
     est_r/est_i [1,257,T]
-Model duoc export voi shape TINH: T = 376 -> chunk bat buoc 3.0 s.
+The model was exported with a STATIC shape: T = 376 -> chunks are exactly 3 s.
 """
 
 import argparse
@@ -65,7 +66,7 @@ import numpy as np
 
 
 # ============================================================================
-# CONFIG — phai khop chinh xac voi luc training / export
+# CONFIG - must match the training / export settings exactly
 # ============================================================================
 
 SR = 16000
@@ -76,20 +77,20 @@ COMP = 0.3
 EPS = 1e-8
 SPK_DIM = 512
 
-DEFAULT_CHUNK_SEC = 3.0          # model export co T tinh -> 3 s
+DEFAULT_CHUNK_SEC = 3.0          # export has a static T -> 3 s
 OVERLAP_RATIO = 0.5              # hop = 1.5 s
 
-# Nguong quyet dinh voice lock (do bang dB suy giam out/in)
-DEFAULT_LOCK_DB = -8.0           # > -8 dB  -> LOCKED (giong target)
-SILENCE_RMS = 3e-3               # duoi muc nay coi nhu im lang
+# Voice lock decision threshold, measured as out/in attenuation in dB
+DEFAULT_LOCK_DB = -8.0           # > -8 dB  -> LOCKED (target speaker)
+SILENCE_RMS = 3e-3               # below this the chunk counts as silence
 
 
 # ============================================================================
-# STFT / iSTFT — numpy thuan, vector hoa cho ARM
+# STFT / iSTFT - pure numpy, vectorized for ARM
 # ============================================================================
 
 def hann_periodic(n):
-    """Hann periodic — giong torch.hann_window(n) (KHONG phai np.hanning)."""
+    """Periodic Hann - same as torch.hann_window(n), NOT np.hanning."""
     return (0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(n) / n)).astype(np.float32)
 
 
@@ -97,13 +98,14 @@ FFT_WIN = hann_periodic(N_FFT)
 
 
 def stft(audio):
-    """STFT center=True, pad reflect. Tra ve (real, imag, mag) [F, T]."""
+    """STFT with center=True and reflect padding. Returns (real, imag, mag)."""
     pad = N_FFT // 2
     x = np.pad(audio, (pad, pad), mode="reflect")
 
     n_frames = 1 + (len(x) - N_FFT) // HOP
 
-    # Tao ma tran frame [T, N_FFT] bang stride trick -> nhanh hon vong for
+    # Build the [T, N_FFT] frame matrix with stride tricks - much faster
+    # than a Python loop over frames
     frames = np.lib.stride_tricks.as_strided(
         x,
         shape=(n_frames, N_FFT),
@@ -120,7 +122,7 @@ def stft(audio):
 
 
 def istft(real, imag, length):
-    """iSTFT overlap-add, bo phan pad center. Tra ve waveform dai `length`."""
+    """Inverse STFT via overlap-add, stripping the center padding."""
     pad = N_FFT // 2
     n_frames = real.shape[1]
 
@@ -143,7 +145,7 @@ def istft(real, imag, length):
 
 
 def normalize_input(mag):
-    """Compressed magnitude normalization — khop voi V49 training."""
+    """Compressed magnitude normalization - matches V49 training."""
     comp = (mag + EPS) ** COMP
     return ((comp - comp.mean()) / max(comp.std(), 1e-3)).astype(np.float32)
 
@@ -157,28 +159,30 @@ def db(x):
 
 
 def _mask_verdict(m):
-    """Doc mask trung binh cua model — chi so chan doan quan trong nhat.
+    """Interpret the model's mean mask - the single best diagnostic.
 
-    Mask la ty le |est| / |mix| MA MODEL TAO RA, truoc khi mu len power.
-    Suy giam cuoi cung = 20 * power * log10(mask), da kiem chung bang so.
+    The mask is the |est| / |mix| ratio the MODEL produced, before it is
+    raised to `power`. The final attenuation follows
+    20 * power * log10(mask), which has been verified numerically.
     """
     if m > 0.80:
-        return "tot — model tu tin day la giong dich"
+        return "good - model is confident this is the target"
     if m > 0.65:
-        return "kha"
+        return "fair"
     if m > 0.45:
-        return "yeu — nghi ngo embedding khong khop"
-    return "rat yeu — model khong nhan ra giong nay"
+        return "weak - suspect the embedding does not match"
+    return "very weak - model does not recognize this voice"
 
 
 def resolve_device(spec, want_input=True):
-    """Quy doi ten thiet bi sang chi so cua sounddevice.
+    """Translate a device name into a sounddevice index.
 
-    Config dung chung voi ban C++, ma ban C++ goi ALSA truc tiep nen ghi
-    kieu 'plughw:2,0'. PortAudio khong hieu chuoi do, nhung ten thiet bi
-    cua no tren Linux thuong chua san '(hw:2,0)' -> bat theo do.
+    The config file is shared with the C++ build, which talks to ALSA
+    directly and therefore uses names like 'plughw:2,0'. PortAudio does not
+    understand those, but on Linux its device names usually embed '(hw:2,0)'
+    so we match on that.
 
-    Chap nhan: None | so nguyen | '3' | 'plughw:2,0' | 'hw:2,0' | ten goi nho
+    Accepts: None | int | '3' | 'plughw:2,0' | 'hw:2,0' | a name fragment
     """
     if spec is None or isinstance(spec, int):
         return spec
@@ -194,7 +198,7 @@ def resolve_device(spec, want_input=True):
     match = re.match(r"(?:plug)?hw:(\d+)(?:,(\d+))?$", spec)
 
     if not match:
-        return spec           # de sounddevice tu khop theo ten
+        return spec           # let sounddevice match it by name
 
     card = match.group(1)
 
@@ -204,7 +208,7 @@ def resolve_device(spec, want_input=True):
     except Exception:
         return None
 
-    # sounddevice dung snake_case (pyaudio moi dung camelCase)
+    # sounddevice uses snake_case (only pyaudio uses camelCase)
     key = "max_input_channels" if want_input else "max_output_channels"
     needle = f"hw:{card},"
 
@@ -213,21 +217,22 @@ def resolve_device(spec, want_input=True):
             print(f"  {spec} -> [{i}] {dev['name']}")
             return i
 
-    print(f"  Canh bao: khong map duoc '{spec}' sang thiet bi PortAudio.")
-    print(f"  Xem danh sach: python voice_lock.py devices")
-    print(f"  Dung chi so thay vi ten ALSA, vi du --in-device 3")
+    print(f"  Warning: could not map '{spec}' to a PortAudio device.")
+    print(f"  List them with: python voice_lock.py devices")
+    print(f"  Then pass an index instead, e.g. --in-device 3")
 
     return None
 
 
 def normalize_output(audio, mode, target_peak=0.95):
-    """Chuan hoa am luong file dau ra.
+    """Normalize the loudness of the output file.
 
-    Chi ap dung MOT he so cho toan bo tin hieu, tuyet doi khong chuan hoa
-    theo tung chunk: lam vay se keo cac doan REJECT (giong nguoi khac) len
-    lai bang doan LOCKED, tuc la pha huy chinh tac dung voice lock.
+    Applies ONE gain to the whole signal, never per chunk: a per-chunk
+    normalizer would lift REJECT segments (other people) back up to LOCKED
+    level, destroying the very effect voice lock provides.
 
-    Luon goi SAU khi da do suppress, de so do khong bi lech.
+    Always call this AFTER suppression has been measured so the figures stay
+    honest.
     """
     if mode == "off":
         return audio
@@ -240,7 +245,7 @@ def normalize_output(audio, mode, target_peak=0.95):
     if mode == "peak":
         return (audio * (target_peak / peak)).astype(np.float32)
 
-    raise ValueError(f"--norm khong ho tro '{mode}'")
+    raise ValueError(f"--norm does not support '{mode}'")
 
 
 # ============================================================================
@@ -248,7 +253,7 @@ def normalize_output(audio, mode, target_peak=0.95):
 # ============================================================================
 
 class VoiceLock:
-    """Chay V49 ONNX + do muc khoa giong tren tung chunk."""
+    """Runs the V49 ONNX model and measures the lock strength per chunk."""
 
     def __init__(self, model_path, emb, mask_power=2.0, output_gain_db=2.0,
                  lock_db=DEFAULT_LOCK_DB, threads=4):
@@ -257,15 +262,15 @@ class VoiceLock:
             import onnxruntime as ort
         except ImportError:
             raise SystemExit(
-                "Thieu onnxruntime. Cai tren Pi 5:\n"
+                "onnxruntime is missing. On a Pi 5:\n"
                 "    pip install onnxruntime numpy sounddevice soundfile")
 
         resolved = _resolve(model_path)
 
         if not os.path.exists(resolved):
             raise FileNotFoundError(
-                f"Khong tim thay model: {model_path}\n"
-                f"  Da do o: {', '.join(_SEARCH)}")
+                f"Model not found: {model_path}\n"
+                f"  Searched: {', '.join(_SEARCH)}")
 
         if resolved != model_path:
             print(f"  -> {resolved}")
@@ -274,7 +279,7 @@ class VoiceLock:
 
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = threads
-        opts.inter_op_num_threads = 1          # Pi 5: 4 core, tranh oversubscribe
+        opts.inter_op_num_threads = 1      # Pi 5 has 4 cores, do not oversubscribe
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
         self.session = ort.InferenceSession(
@@ -284,13 +289,13 @@ class VoiceLock:
 
         self.spk_emb = self._prepare_emb(emb)
 
-        self.target_rms = 0.1                  # muc RMS LibriMix luc training
+        self.target_rms = 0.1                  # LibriMix RMS level at training
         self.min_rms = SILENCE_RMS
         self.mask_power = float(mask_power)
         self.output_gain = 10.0 ** (float(output_gain_db) / 20.0)
         self.lock_db = float(lock_db)
 
-        # thong ke
+        # statistics
         self.n_chunks = 0
         self.total_ms = 0.0
 
@@ -302,16 +307,17 @@ class VoiceLock:
         missing = [n for n in expected if n not in names]
         if missing:
             raise RuntimeError(
-                "Model khong dung interface V49.\n"
-                f"  can  : {expected}\n"
-                f"  thay : {names}\n"
-                "Day khong phai file v49_*.onnx?")
+                "Model does not match the V49 interface.\n"
+                f"  expected: {expected}\n"
+                f"  found   : {names}\n"
+                "Is this really a v49_*.onnx file?")
 
         out_names = [o.name for o in self.session.get_outputs()]
         if "est_r" not in out_names or "est_i" not in out_names:
-            raise RuntimeError(f"Output khong dung: {out_names}")
+            raise RuntimeError(f"Unexpected outputs: {out_names}")
 
-        # Model export khong co dynamic_axes -> T co dinh. Lay T tu graph.
+        # The export has no dynamic_axes, so T is fixed. Read it from the
+        # graph rather than hardcoding it.
         shape = self.session.get_inputs()[names.index("mr")].shape
         t_dim = shape[-1]
 
@@ -329,7 +335,7 @@ class VoiceLock:
         self.fade_win = hann_periodic(self.chunk_samples)
 
         print(f"  input T     : {t_dim} frames "
-              f"({'co dinh' if self.fixed_length else 'dong'})")
+              f"({'fixed' if self.fixed_length else 'dynamic'})")
         print(f"  chunk       : {self.chunk_sec:.2f} s "
               f"({self.chunk_samples} samples), hop "
               f"{self.hop_samples / SR:.2f} s")
@@ -337,29 +343,30 @@ class VoiceLock:
     # ------------------------------------------------------------------
     def _prepare_emb(self, emb):
         if isinstance(emb, str):
-            if not os.path.exists(emb):
+            path = _resolve(emb)
+            if not os.path.exists(path):
                 raise FileNotFoundError(
-                    f"Khong tim thay embedding: {emb}\n"
-                    "Tao bang: python voice_lock.py enroll --seconds 10")
-            emb = np.load(emb)
+                    f"Embedding not found: {emb}\n"
+                    "Create one with: python voice_lock.py enroll --seconds 10")
+            emb = np.load(path)
 
         emb = np.asarray(emb, dtype=np.float32).reshape(1, -1)
 
         if emb.shape[1] != SPK_DIM:
             raise ValueError(
-                f"Embedding phai la {SPK_DIM}-d, dang co {emb.shape[1]}-d")
+                f"Embedding must be {SPK_DIM}-d, this one is {emb.shape[1]}-d")
 
-        # L2 normalize cho chac (WavLM output da normalize san)
+        # L2 normalize for safety (WavLM output is already normalized)
         emb = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-8)
 
         return emb.astype(np.float32)
 
     # ------------------------------------------------------------------
     def process(self, chunk):
-        """Chay 1 chunk. Tra ve (extracted, stats dict)."""
+        """Process one chunk. Returns (extracted, stats dict)."""
         chunk = np.asarray(chunk, dtype=np.float32)
 
-        # Model co shape tinh -> pad / cat cho dung do dai
+        # Static model shape -> pad or trim to the exact length
         n = len(chunk)
         if n < self.chunk_samples:
             chunk = np.pad(chunk, (0, self.chunk_samples - n))
@@ -375,7 +382,7 @@ class VoiceLock:
                 "mask": 0.0,
             }
 
-        # Chuan hoa muc vao cho khop domain training
+        # Bring the input level into the training domain
         gain_in = self.target_rms / in_rms
         normalized = chunk * gain_in
 
@@ -391,19 +398,20 @@ class VoiceLock:
              "mr": mr_b, "mi": mi_b, "mm": mm_b},
         )
 
-        # Mask hieu dung MA MODEL TAO RA, truoc khi mu len power.
-        # Day la chi so chan doan quan trong nhat:
-        #   ~0.85  model tu tin day la giong dich
-        #   ~0.50  model khong chac -> nghi ngo embedding
-        # Lay trung binh co trong so theo bien do, vi cac bin gan nhu trong
-        # co ty le est/mix vo nghia.
+        # The mask the MODEL produced, before raising it to power. This is
+        # the most useful diagnostic available:
+        #   ~0.85  the model is confident this is the target
+        #   ~0.50  it is unsure -> suspect the embedding
+        # Weighted by magnitude, because near-empty bins have a meaningless
+        # est/mix ratio and would drag a flat average around.
         est_mag = np.sqrt(est_r ** 2 + est_i ** 2 + EPS)
         mask = np.clip(est_mag / (mm_b + EPS), 0.0, 1.0)
 
         weight = float(mm_b.sum())
         mask_mean = float((mm_b * mask).sum() / (weight + 1e-12))
 
-        # Mask sharpening: mu mask len power roi ap lai vao STFT goc
+        # Mask sharpening: raise the mask to `power`, reapply to the
+        # original STFT
         if self.mask_power != 1.0:
             sharp = mask ** self.mask_power
             est_r = mr_b * sharp
@@ -418,7 +426,8 @@ class VoiceLock:
         self.total_ms += ms
 
         out_rms = rms(extracted)
-        # Bo phan output_gain khoi phep do de nguong khong bi lech
+        # Exclude output_gain from the measurement so the threshold does not
+        # shift when --gain changes
         suppress = db(out_rms / self.output_gain) - db(in_rms)
 
         return extracted[:n], {
@@ -439,14 +448,14 @@ class VoiceLock:
 
 
 # ============================================================================
-# MODE: enroll — tao speaker embedding (can torch + transformers)
+# MODE: enroll - build the speaker embedding
 # ============================================================================
 
 def cmd_enroll(args):
     import soundfile as sf
 
     print("=" * 62)
-    print("ENROLLMENT — tao speaker embedding 512-d (WavLM)")
+    print("ENROLLMENT - build a 512-d speaker embedding (WavLM)")
     print("=" * 62)
 
     if args.wav:
@@ -455,14 +464,15 @@ def cmd_enroll(args):
             audio = audio.mean(axis=1)
         if sr != SR:
             raise SystemExit(
-                f"File {args.wav} la {sr} Hz, can {SR} Hz. "
-                "Convert truoc: sox in.wav -r 16000 -c 1 out.wav")
-        print(f"  doc: {args.wav} ({len(audio) / SR:.1f} s)")
+                f"File {args.wav} is {sr} Hz, {SR} Hz is required. "
+                "Convert first: sox in.wav -r 16000 -c 1 out.wav")
+        print(f"  read: {args.wav} ({len(audio) / SR:.1f} s)")
     else:
         import sounddevice as sd
 
-        print(f"\n  Ghi am {args.seconds:.0f} s. Noi tu nhien, thay doi ngu dieu,")
-        print("  doc nhieu cau khac nhau -> embedding phan biet tot hon.\n")
+        print(f"\n  Recording {args.seconds:.0f} s. Speak naturally, vary your")
+        print("  intonation, read different sentences - the more varied, the")
+        print("  more distinctive the embedding.\n")
         for i in range(3, 0, -1):
             print(f"  {i}...")
             time.sleep(1)
@@ -474,14 +484,14 @@ def cmd_enroll(args):
         audio = audio.squeeze()
 
         sf.write(args.out_wav, audio, SR)
-        print(f"  luu: {args.out_wav}")
+        print(f"  saved: {args.out_wav}")
 
     r, peak = rms(audio), float(np.abs(audio).max())
     print(f"  RMS={r:.4f}  peak={peak:.4f}")
     if r < 0.005:
-        print("  CANH BAO: qua nho — kiem tra mic / tang gain (alsamixer)")
+        print("  WARNING: very quiet - check the mic / raise gain (alsamixer)")
     if peak > 0.95:
-        print("  CANH BAO: clipping — lui ra xa mic")
+        print("  WARNING: clipping - move further from the mic")
 
     encoder = args.encoder or _autodetect_encoder()
 
@@ -490,24 +500,24 @@ def cmd_enroll(args):
     np.save(args.emb, emb)
 
     print(f"\n  embedding: {emb.shape} -> {args.emb}")
-    print(f"  {n_seg} segment, consistency {consistency:.3f} "
-          f"(>0.85 tot, <0.7 nhieu)")
+    print(f"  {n_seg} segments, consistency {consistency:.3f} "
+          f"(>0.85 good, <0.7 noisy)")
 
     if consistency < 0.7:
-        print("  Nen ghi lai o noi yen tinh hon.")
+        print("  Consider re-recording somewhere quieter.")
 
-    print("\n  Test ngay:")
+    print("\n  Try it now:")
     print(f"    python voice_lock.py inspect --emb {args.emb}")
     print(f"    python voice_lock.py live --emb {args.emb}")
 
 
-# Cac thu muc se do khi duong dan tuong doi khong ton tai. Cho phep chay
-# script tu bat ky dau ma van thay models/ o goc project.
+# Directories probed when a relative path does not exist. Lets the script run
+# from anywhere and still find models/ at the project root.
 _SEARCH = ("models", "../models", "../../models", ".", "..", "../..")
 
 
 def _resolve(path):
-    """Tim file theo `path`, neu khong co thi do ten file trong _SEARCH."""
+    """Locate `path`; if missing, probe its basename inside _SEARCH."""
     if not path or os.path.isabs(path) or os.path.exists(path):
         return path
 
@@ -521,7 +531,7 @@ def _resolve(path):
 
 
 def _autodetect_encoder():
-    """Tu tim WavLM encoder ONNX trong cac vi tri thong thuong."""
+    """Look for the WavLM ONNX encoder in the usual places."""
     for name in ("wavlm_sv_int8.onnx", "wavlm_sv_fp32.onnx"):
         path = _resolve(name)
         if os.path.exists(path):
@@ -530,7 +540,7 @@ def _autodetect_encoder():
 
 
 def _segment(audio):
-    """Cat thanh cac segment 3 s chong lan, bo doan im lang."""
+    """Split into overlapping 3 s segments, dropping the silent ones."""
     seg_len = 3 * SR
     seg_hop = int(1.5 * SR)
 
@@ -539,7 +549,7 @@ def _segment(audio):
     segments = [s for s in segments if rms(s) > 0.005]
 
     if not segments:
-        print("  Khong co segment nao du to — dung toan bo audio")
+        print("  No segment was loud enough - using the whole recording")
         if len(audio) < seg_len:
             reps = int(np.ceil(seg_len / max(len(audio), 1)))
             audio = np.tile(audio, reps)[:seg_len]
@@ -549,17 +559,17 @@ def _segment(audio):
 
 
 def _norm_segment(seg):
-    """Chuan hoa mean/var — khop voi Wav2Vec2FeatureExtractor cua WavLM."""
+    """Mean/variance normalization - matches WavLM's Wav2Vec2FeatureExtractor."""
     x = np.ascontiguousarray(seg, dtype=np.float32)[None]
     return ((x - x.mean(-1, keepdims=True))
             / np.sqrt(x.var(-1, keepdims=True) + 1e-7)).astype(np.float32)
 
 
 def _wavlm_embedding(audio, encoder_path=None):
-    """10 s -> nhieu segment 3 s chong lan -> trung binh embedding.
+    """10 s -> overlapping 3 s segments -> averaged embedding.
 
-    Uu tien encoder ONNX (khong can torch). Neu khong co thi fallback
-    ve transformers + torch.
+    Prefers the ONNX encoder (no torch required) and falls back to
+    transformers + torch when none is available.
     """
     segments = _segment(audio)
 
@@ -582,20 +592,20 @@ def _wavlm_embedding(audio, encoder_path=None):
 
 
 def _embed_onnx(segments, encoder_path):
-    """Duong chinh tren Pi 5 — chi can onnxruntime."""
+    """The main path on a Pi 5 - only needs onnxruntime."""
     try:
         import onnxruntime as ort
     except ImportError:
-        raise SystemExit("Thieu onnxruntime: pip install onnxruntime")
+        raise SystemExit("onnxruntime is missing: pip install onnxruntime")
 
     encoder_path = _resolve(encoder_path)
 
     if not os.path.exists(encoder_path):
         raise SystemExit(
-            f"Khong tim thay encoder ONNX: {encoder_path}\n"
-            "Tao tren laptop bang: python export_wavlm_onnx.py")
+            f"ONNX encoder not found: {encoder_path}\n"
+            "Build it on a laptop with: python export_wavlm_onnx.py")
 
-    print(f"\n  Encoder ONNX: {encoder_path} (khong can PyTorch)")
+    print(f"\n  ONNX encoder: {encoder_path} (no PyTorch needed)")
 
     opts = ort.SessionOptions()
     opts.intra_op_num_threads = 4
@@ -607,9 +617,9 @@ def _embed_onnx(segments, encoder_path):
     names = [i.name for i in sess.get_inputs()]
     if "input_values" not in names:
         raise SystemExit(
-            f"Encoder khong dung interface. Can 'input_values', thay {names}")
+            f"Encoder interface mismatch. Expected 'input_values', got {names}")
 
-    print(f"  {len(segments)} segment...", end="", flush=True)
+    print(f"  {len(segments)} segments", end="", flush=True)
 
     embs = []
     for seg in segments:
@@ -618,30 +628,30 @@ def _embed_onnx(segments, encoder_path):
         embs.append(e / (np.linalg.norm(e) + 1e-8))
         print(".", end="", flush=True)
 
-    print(" xong")
+    print(" done")
 
     if embs[0].shape[0] != SPK_DIM:
         raise SystemExit(
-            f"Encoder tra ve {embs[0].shape[0]}-d, V49 can {SPK_DIM}-d")
+            f"Encoder returned {embs[0].shape[0]}-d, V49 needs {SPK_DIM}-d")
 
     return embs
 
 
 def _embed_torch(segments):
-    """Fallback khi chua export encoder — can torch + transformers."""
+    """Fallback when no encoder has been exported - needs torch."""
     try:
         import torch
         import torch.nn.functional as F
         from transformers import WavLMForXVector
     except ImportError:
         raise SystemExit(
-            "Khong co encoder ONNX va cung khong co PyTorch.\n"
-            "Chon 1 trong 2:\n"
-            "  a) Enroll tren laptop roi copy speaker_emb.npy sang Pi\n"
-            "  b) Tren laptop chay export_wavlm_onnx.py, copy file .onnx sang\n"
-            "     Pi, roi enroll voi --encoder wavlm_sv_int8.onnx")
+            "No ONNX encoder and no PyTorch either.\n"
+            "Pick one:\n"
+            "  a) Enroll on a laptop and copy speaker_emb.npy to the Pi\n"
+            "  b) Run export_wavlm_onnx.py on a laptop, copy the .onnx to\n"
+            "     the Pi, then enroll with --encoder wavlm_sv_int8.onnx")
 
-    print("\n  Load WavLM-base-plus-sv (PyTorch)...")
+    print("\n  Loading WavLM-base-plus-sv (PyTorch)...")
     model = WavLMForXVector.from_pretrained(
         "microsoft/wavlm-base-plus-sv").eval()
 
@@ -656,12 +666,12 @@ def _embed_torch(segments):
 
 
 # ============================================================================
-# MODE: inspect — chan doan chat luong embedding
+# MODE: inspect - diagnose embedding quality
 # ============================================================================
 
 def cmd_inspect(args):
     print("=" * 62)
-    print("PHAN TICH EMBEDDING")
+    print("EMBEDDING ANALYSIS")
     print("=" * 62)
 
     loaded = []
@@ -670,7 +680,7 @@ def cmd_inspect(args):
         resolved = _resolve(path)
 
         if not os.path.exists(resolved):
-            print(f"\n  {path}: KHONG TIM THAY")
+            print(f"\n  {path}: NOT FOUND")
             continue
 
         raw = np.load(resolved)
@@ -687,41 +697,41 @@ def cmd_inspect(args):
         near_zero = int((np.abs(flat) < 1e-6).sum())
 
         print(f"    L2 norm    : {norm:.4f}"
-              f"{'' if abs(norm - 1.0) < 0.01 else '   <-- khong phai vector don vi'}")
+              f"{'' if abs(norm - 1.0) < 0.01 else '   <-- not a unit vector'}")
         print(f"    mean/std   : {flat.mean():+.5f} / {flat.std():.5f}")
         print(f"    min/max    : {flat.min():+.4f} / {flat.max():+.4f}")
         print(f"    |x| < 1e-6 : {near_zero} / {flat.size}")
         print(f"    NaN / Inf  : {n_nan} / {n_inf}")
 
-        # --- cac dang hong ---
+        # --- failure modes ---
         problems = []
 
         if flat.size != SPK_DIM:
             problems.append(
-                f"kich thuoc {flat.size}, V49 can {SPK_DIM} -> khong dung duoc")
+                f"size {flat.size}, V49 needs {SPK_DIM} -> unusable")
         if n_nan or n_inf:
-            problems.append("co NaN/Inf -> file hong, enroll lai")
+            problems.append("contains NaN/Inf -> corrupt file, re-enroll")
         if norm < 1e-6:
             problems.append(
-                "toan so 0 -> luc enroll thu duoc im lang. Kiem tra mic "
-                "(--in-device) va muc thu (alsamixer)")
+                "all zeros -> enrollment recorded silence. Check the mic "
+                "(--in-device) and the capture level (alsamixer)")
         elif flat.std() < 1e-6:
-            problems.append("moi phan tu gan nhu bang nhau -> embedding vo nghia")
+            problems.append("every value is nearly identical -> meaningless")
         if near_zero > flat.size * 0.5:
-            problems.append("qua nua phan tu bang 0 -> nghi ngo file hong")
+            problems.append("over half the values are zero -> likely corrupt")
 
         if problems:
             for p in problems:
-                print(f"    -> LOI: {p}")
+                print(f"    -> ERROR: {p}")
         else:
             print(f"    -> OK")
             loaded.append((label, flat / (norm + 1e-12)))
 
     # ----------------------------------------------------------------
-    # So sanh tung cap
+    # Pairwise comparison
     # ----------------------------------------------------------------
     if len(loaded) > 1:
-        print("\n  Cosine tung cap:")
+        print("\n  Pairwise cosine:")
         print()
 
         width = max(len(n) for n, _ in loaded) + 2
@@ -734,7 +744,7 @@ def cmd_inspect(args):
             print(row)
 
     # ----------------------------------------------------------------
-    # So voi ban ghi moi — phep kiem manh nhat
+    # Compare against a fresh recording - the strongest check there is
     # ----------------------------------------------------------------
     if args.wav:
         import soundfile as sf
@@ -743,46 +753,47 @@ def cmd_inspect(args):
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
         if sr != SR:
-            raise SystemExit(f"{args.wav} la {sr} Hz, can {SR} Hz")
+            raise SystemExit(f"{args.wav} is {sr} Hz, {SR} Hz is required")
 
-        print(f"\n  Tinh embedding tu {args.wav} ({len(audio)/SR:.1f} s)")
+        print(f"\n  Computing an embedding from {args.wav} "
+              f"({len(audio)/SR:.1f} s)")
 
         encoder = args.encoder or _autodetect_encoder()
         fresh, n_seg, consistency = _wavlm_embedding(audio, encoder)
 
-        print(f"  {n_seg} segment, consistency {consistency:.3f}")
-        print("\n  Cosine voi cac embedding o tren:")
+        print(f"  {n_seg} segments, consistency {consistency:.3f}")
+        print("\n  Cosine against the embeddings above:")
 
         for name, e in loaded:
             cos = float(np.dot(fresh, e))
             if cos > 0.85:
-                verdict = "khop rat tot"
+                verdict = "very good match"
             elif cos > 0.7:
-                verdict = "khop"
+                verdict = "match"
             elif cos > 0.5:
-                verdict = "yeu — co the khac nguoi"
+                verdict = "weak - possibly a different person"
             else:
-                verdict = "KHONG khop"
+                verdict = "NO match"
             print(f"    {name:<20} {cos:>6.3f}   {verdict}")
 
     # ----------------------------------------------------------------
-    # Moc tham chieu
+    # Reference points
     # ----------------------------------------------------------------
     rng = np.random.default_rng(0)
     r = rng.normal(size=(2000, SPK_DIM))
     r /= np.linalg.norm(r, axis=1, keepdims=True)
 
-    # abs PHAI dat ngoai tong: can |tich vo huong|, khong phai tong |a_i*b_i|
+    # abs MUST sit outside the sum: we want |dot product|, not sum(|a_i*b_i|)
     cos_random = (r[:1000] * r[1000:]).sum(axis=1)
     baseline = float(np.abs(cos_random).mean())
 
-    print("\n  Moc tham chieu:")
-    print(f"    2 vector ngau nhien {SPK_DIM}-d : |cos| ~ {baseline:.3f}"
-          f"  (do lech chuan {cos_random.std():.3f})")
-    print("    cung nguoi, ban ghi khac  : thuong > 0.85")
-    print("    khac nguoi                : thuong 0.5 - 0.8")
-    print("\n  Cosine giua hai nguoi khac nhau ma > 0.95 nghia la embedding")
-    print("  khong phan biet duoc ai — kiem tra lai buoc enroll.")
+    print("\n  Reference points:")
+    print(f"    two random {SPK_DIM}-d vectors : |cos| ~ {baseline:.3f}"
+          f"  (std {cos_random.std():.3f})")
+    print("    same person, other recording : usually > 0.85")
+    print("    different people             : usually 0.5 - 0.8")
+    print("\n  A cosine above 0.95 between two DIFFERENT people means the")
+    print("  embedding cannot tell them apart - revisit the enrollment.")
 
 
 # ============================================================================
@@ -810,22 +821,22 @@ def cmd_bench(args):
     times = np.array(times)
     rtf = times.mean() / (vl.chunk_sec * 1000.0)
 
-    print(f"\n  Benchmark ({n} lan, chunk {vl.chunk_sec:.1f} s, "
+    print(f"\n  Benchmark ({n} runs, {vl.chunk_sec:.1f} s chunks, "
           f"{args.threads} threads)")
     print(f"    mean   : {times.mean():7.0f} ms")
     print(f"    median : {np.median(times):7.0f} ms")
     print(f"    min/max: {times.min():.0f} / {times.max():.0f} ms")
     print(f"    RTF    : {rtf:.3f}   "
-          f"{'REALTIME OK' if rtf < 1.0 else 'QUA CHAM'}")
+          f"{'REALTIME OK' if rtf < 1.0 else 'TOO SLOW'}")
 
     budget = vl.hop_samples / SR * 1000.0
-    print(f"\n    Ngan sach 1 hop = {budget:.0f} ms "
-          f"-> {'du' if times.mean() < budget else 'THIEU, se drop audio'}")
+    print(f"\n    Budget per hop = {budget:.0f} ms "
+          f"-> {'enough' if times.mean() < budget else 'NOT ENOUGH, audio will drop'}")
 
     if rtf >= 1.0:
-        print("\n  Cach tang toc tren Pi 5:")
-        print("    - --power 1 (bo sharpening, ~20% nhanh hon)")
-        print("    - --threads 4 va tat cac process nang khac")
+        print("\n  Ways to speed this up on a Pi 5:")
+        print("    - --power 1 (drops sharpening, ~20% faster)")
+        print("    - --threads 4 and close other heavy processes")
         print("    - sudo cpufreq-set -g performance")
 
 
@@ -842,7 +853,7 @@ def cmd_file(args):
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
     if sr != SR:
-        raise SystemExit(f"File la {sr} Hz, model can {SR} Hz.")
+        raise SystemExit(f"File is {sr} Hz, the model needs {SR} Hz.")
 
     total = len(audio)
     win, hop = vl.chunk_samples, vl.hop_samples
@@ -876,23 +887,24 @@ def cmd_file(args):
     peak = float(np.abs(output).max())
 
     if getattr(args, "norm", "off") != "off":
-        # Ap MOT he so cho ca file, sau khi da do xong suppress -> khong
-        # lam lech so do, va giu nguyen chenh lech giua LOCKED va REJECT.
+        # ONE gain for the whole file, applied after suppression has been
+        # measured, so the figures stay honest and LOCKED still sits above
+        # REJECT.
         output = normalize_output(output, args.norm)
         print(f"\n  (--norm {args.norm}: peak {peak:.4f} -> "
               f"{float(np.abs(output).max()):.4f})")
     elif peak > 1.0:
         output /= peak
-        print(f"\n  (chuan hoa lai vi clipping, peak was {peak:.2f})")
+        print(f"\n  (rescaled to avoid clipping, peak was {peak:.2f})")
 
     sf.write(args.output, output, SR)
 
     _summary(vl, stats)
-    print(f"\n  Da luu: {args.output}")
+    print(f"\n  Saved: {args.output}")
 
 
 # ============================================================================
-# MODE: verify — A/B giong dung vs giong sai
+# MODE: verify - A/B the correct voice against a different one
 # ============================================================================
 
 def cmd_verify(args):
@@ -902,7 +914,7 @@ def cmd_verify(args):
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
     if sr != SR:
-        raise SystemExit(f"File la {sr} Hz, model can {SR} Hz.")
+        raise SystemExit(f"File is {sr} Hz, the model needs {SR} Hz.")
 
     results = {}
     for label, emb_path in (("TARGET", args.emb_target),
@@ -920,23 +932,25 @@ def cmd_verify(args):
         sup = [s for s in sup if s != 0.0]
 
         results[label.strip()] = float(np.mean(sup)) if sup else 0.0
-        print(f"      suppression trung binh: {results[label.strip()]:+.1f} dB")
+        print(f"      mean suppression: {results[label.strip()]:+.1f} dB")
 
     gap = results["TARGET"] - results["OTHER"]
 
     print("\n" + "=" * 62)
-    print("KET QUA VOICE LOCK")
+    print("VOICE LOCK RESULT")
     print("=" * 62)
-    print(f"  giong dung (target) : {results['TARGET']:+6.1f} dB  (cang gan 0 cang tot)")
-    print(f"  giong sai  (other)  : {results['OTHER']:+6.1f} dB  (cang am cang tot)")
-    print(f"  khoang cach         : {gap:+6.1f} dB")
+    print(f"  correct voice (target) : {results['TARGET']:+6.1f} dB  "
+          f"(closer to 0 is better)")
+    print(f"  wrong voice   (other)  : {results['OTHER']:+6.1f} dB  "
+          f"(more negative is better)")
+    print(f"  gap                    : {gap:+6.1f} dB")
 
     if gap > 6.0:
-        print("\n  => LOCK TOT: model phan biet ro theo enrollment.")
+        print("\n  => GOOD LOCK: the model clearly follows the enrollment.")
     elif gap > 3.0:
-        print("\n  => LOCK YEU: nen enroll lai 10-15 s, tang --power.")
+        print("\n  => WEAK LOCK: re-enroll for 10-15 s, raise --power.")
     else:
-        print("\n  => KHONG LOCK: kiem tra lai embedding / file dau vao.")
+        print("\n  => NO LOCK: check the embedding and the input file.")
 
 
 # ============================================================================
@@ -958,7 +972,7 @@ def cmd_live(args):
         "outw": np.zeros(chunk_n, dtype=np.float32),
         "pending": 0,
         "last": {"state": "---", "in_db": -99.0, "out_db": -99.0,
-                 "suppress_db": 0.0, "ms": 0.0},
+                 "suppress_db": 0.0, "mask": 0.0, "ms": 0.0},
         "hist": [],
     }
 
@@ -1003,11 +1017,11 @@ def cmd_live(args):
             rec_out.append(safe.copy())
 
     print(f"\n  chunk {vl.chunk_sec:.1f} s / hop {hop_n / SR:.1f} s, "
-          f"nguong lock {vl.lock_db:+.1f} dB")
-    print("  DEO TAI NGHE — dung loa se bi hu (feedback).")
+          f"lock threshold {vl.lock_db:+.1f} dB")
+    print("  WEAR HEADPHONES - speakers will cause feedback.")
     if args.save:
-        print(f"  ghi ra: {args.save}_input.wav / {args.save}_output.wav")
-    print("  Ctrl+C de dung.\n")
+        print(f"  recording to: {args.save}_input.wav / {args.save}_output.wav")
+    print("  Ctrl+C to stop.\n")
     print(f"  {'chunk':>6} {'in dB':>8} {'out dB':>9} {'suppress':>10} "
           f"{'mask':>6} {'ms':>7} {'RTF':>6}  state")
     print("  " + "-" * 70)
@@ -1028,7 +1042,7 @@ def cmd_live(args):
                           f"{st['mask']:6.3f} {st['ms']:6.0f} {vl.rtf:6.3f}  "
                           f"{st['state']:<7} {bar}")
         except KeyboardInterrupt:
-            print("\n\n  Dung.")
+            print("\n\n  Stopped.")
 
     _summary(vl, state["hist"])
 
@@ -1040,14 +1054,14 @@ def cmd_live(args):
         a, b = a[:L], b[:L]
 
         if getattr(args, "norm", "off") != "off":
-            # Chi chuan hoa file da luu, khong anh huong am thanh phat ra
-            # luc chay va cung khong anh huong so do suppress.
+            # Only the saved file is normalized - this changes neither what
+            # was played live nor the suppression figures.
             b = normalize_output(b, args.norm)
-            print(f"  (--norm {args.norm} ap cho file output)")
+            print(f"  (--norm {args.norm} applied to the output file)")
 
         sf.write(f"{args.save}_input.wav", a, SR)
         sf.write(f"{args.save}_output.wav", b, SR)
-        print(f"\n  Da luu {L / SR:.1f} s:")
+        print(f"\n  Saved {L / SR:.1f} s:")
         print(f"    {args.save}_input.wav")
         print(f"    {args.save}_output.wav")
 
@@ -1076,28 +1090,28 @@ def _summary(vl, stats):
     stats = [s for s in stats if s["state"] != "SILENCE"]
 
     print("\n" + "=" * 62)
-    print("TONG KET")
+    print("SUMMARY")
     print("=" * 62)
 
     if vl.n_chunks == 0 or not stats:
-        print("  Khong co chunk nao co tieng.")
+        print("  No chunk contained any sound.")
         return
 
     sup = np.array([s["suppress_db"] for s in stats])
     locked = sum(1 for s in stats if s["state"] == "LOCKED")
 
-    print(f"  chunk co tieng : {len(stats)}")
-    print(f"  LOCKED         : {locked} ({100 * locked / len(stats):.0f}%)")
-    print(f"  REJECT         : {len(stats) - locked}")
-    print(f"  suppress       : trung binh {sup.mean():+.1f} dB, "
+    print(f"  chunks with sound : {len(stats)}")
+    print(f"  LOCKED            : {locked} ({100 * locked / len(stats):.0f}%)")
+    print(f"  REJECT            : {len(stats) - locked}")
+    print(f"  suppression       : mean {sup.mean():+.1f} dB, "
           f"min {sup.min():+.1f} / max {sup.max():+.1f}")
 
     mk = np.array([s["mask"] for s in stats])
-    print(f"  mask cua model : trung binh {mk.mean():.3f}  "
+    print(f"  model mask        : mean {mk.mean():.3f}  "
           f"({_mask_verdict(mk.mean())})")
-    print(f"  latency        : {vl.total_ms / vl.n_chunks:.0f} ms/chunk, "
+    print(f"  latency           : {vl.total_ms / vl.n_chunks:.0f} ms/chunk, "
           f"RTF {vl.rtf:.3f} "
-          f"({'realtime OK' if vl.rtf < 1.0 else 'QUA CHAM'})")
+          f"({'realtime OK' if vl.rtf < 1.0 else 'TOO SLOW'})")
 
 
 def cmd_devices(_args):
@@ -1107,16 +1121,16 @@ def cmd_devices(_args):
 
 
 # ============================================================================
-# FILE CONFIG
+# CONFIG FILE
 #
-# Dang key = value, '#' la ghi chu. Gia tri trong file duoc dung lam
-# DEFAULT cua argparse, nen tham so dong lenh tu dong ghi de len no.
-# Thu tu uu tien: mac dinh <  voice_lock.conf  <  dong lenh
+# Format is key = value with '#' comments. Values from the file become the
+# argparse DEFAULTS, so command line arguments override them automatically.
+# Precedence: defaults  <  voice_lock.conf  <  command line
 # ============================================================================
 
 CONFIG_FILE = "voice_lock.conf"
 
-# key -> ham ep kieu
+# key -> coercion function
 CONFIG_KEYS = {
     "model": str, "emb": str, "encoder": str,
     "power": float, "gain": float, "lock_db": float,
@@ -1128,13 +1142,13 @@ CONFIG_KEYS = {
 
 
 def _load_config(path=None):
-    """Doc file config. Tra ve (dict gia tri, duong dan da dung)."""
+    """Read the config file. Returns (values dict, path that was used)."""
     explicit = path is not None
     found = _resolve(path or CONFIG_FILE)
 
     if not os.path.exists(found):
         if explicit:
-            raise SystemExit(f"Khong tim thay file config: {path}")
+            raise SystemExit(f"Config file not found: {path}")
         return {}, None
 
     cfg = {}
@@ -1146,43 +1160,42 @@ def _load_config(path=None):
                 continue
 
             if "=" not in line:
-                raise SystemExit(
-                    f"{found}:{lineno}: thieu dau '=' o dong: {line}")
+                raise SystemExit(f"{found}:{lineno}: missing '=' on line: {line}")
 
             key, value = line.split("=", 1)
             key = key.strip().replace("-", "_")
             value = value.strip()
 
             if not value:
-                continue                      # key bo trong = giu mac dinh
+                continue                      # present but blank = keep default
 
             if key not in CONFIG_KEYS:
-                # Go sai ten key ma bo qua im lang la cai bay: nguoi dung
-                # tuong da doi cau hinh nhung thuc te khong.
+                # Silently ignoring a misspelled key is a trap: you think you
+                # changed the configuration when nothing actually changed.
                 valid = "\n".join(f"  {k}" for k in sorted(CONFIG_KEYS))
                 raise SystemExit(
-                    f"{found}:{lineno}: key khong hop le '{key}'\n"
-                    f"  Key hop le:\n{valid}")
+                    f"{found}:{lineno}: invalid key '{key}'\n"
+                    f"  Valid keys:\n{valid}")
 
             try:
                 cfg[key] = CONFIG_KEYS[key](value)
             except ValueError:
                 raise SystemExit(
-                    f"{found}:{lineno}: '{value}' khong doi duoc sang "
-                    f"{CONFIG_KEYS[key].__name__} cho key '{key}'")
+                    f"{found}:{lineno}: '{value}' is not a valid "
+                    f"{CONFIG_KEYS[key].__name__} for key '{key}'")
 
     return cfg, found
 
 
 def _prescan_config(argv):
-    """Tim --config / --no-config truoc khi argparse chay."""
+    """Find --config / --no-config before argparse runs."""
     if "--no-config" in argv:
         return None, True
 
     if "--config" in argv:
         i = argv.index("--config")
         if i + 1 >= len(argv):
-            raise SystemExit("Thieu duong dan sau --config")
+            raise SystemExit("Missing path after --config")
         return argv[i + 1], False
 
     return None, False
@@ -1198,57 +1211,58 @@ def main():
     config_path, skip = _prescan_config(argv)
     cfg, cfg_used = ({}, None) if skip else _load_config(config_path)
 
-    # Bo --config/--no-config ra khoi argv de argparse khong phai biet toi
+    # Strip --config/--no-config so argparse never has to know about them
     argv = [a for a in argv if a != "--no-config"]
     if config_path is not None:
         i = argv.index("--config")
         del argv[i:i + 2]
 
     def d(key, fallback):
-        """Gia tri mac dinh: lay tu config neu co, khong thi dung fallback."""
+        """Default value: from the config file if present, else `fallback`."""
         return cfg.get(key, fallback)
 
     p = argparse.ArgumentParser(
-        description="V49 voice lock test — Raspberry Pi 5",
-        epilog="Dat cac gia tri hay dung vao voice_lock.conf "
-               "roi khoi go moi lan.\n"
-               "Thu tu uu tien: mac dinh < voice_lock.conf < dong lenh.\n"
-               "Bo qua config: --no-config    File khac: --config PATH",
+        description="V49 voice lock test - Raspberry Pi 5",
+        epilog="Put the values you use often into voice_lock.conf and stop\n"
+               "typing them every time.\n"
+               "Precedence: defaults < voice_lock.conf < command line.\n"
+               "Skip the file: --no-config    Use another: --config PATH",
         formatter_class=argparse.RawDescriptionHelpFormatter)
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def add_model_args(sp, need_emb=True):
         sp.add_argument("--model", default=d("model", "v49_int8.onnx"),
-                        help="file .onnx (tu do trong models/)")
+                        help="the .onnx file (searched under models/)")
         if need_emb:
             sp.add_argument("--emb", default=d("emb", "speaker_emb.npy"),
-                            help="speaker embedding 512-d (.npy)")
+                            help="512-d speaker embedding (.npy)")
         sp.add_argument("--power", type=float, default=d("power", 2.0),
-                        help="mask sharpening (1=tat, 2=mac dinh, 3=manh)")
+                        help="mask sharpening (1=off, 2=default, 3=strong)")
         sp.add_argument("--gain", type=float, default=d("gain", 2.0),
-                        help="gain dau ra (dB)")
+                        help="output gain in dB")
         sp.add_argument("--lock-db", type=float,
                         default=d("lock_db", DEFAULT_LOCK_DB),
-                        dest="lock_db", help="nguong quyet dinh LOCKED (dB)")
+                        dest="lock_db", help="LOCKED decision threshold (dB)")
         sp.add_argument("--threads", type=int, default=d("threads", 4),
-                        help="so thread ONNX (Pi 5 co 4 core)")
+                        help="ONNX thread count (a Pi 5 has 4 cores)")
         sp.add_argument("--norm", choices=("off", "peak"),
                         default=d("norm", "off"),
-                        help="chuan hoa am luong FILE dau ra "
-                             "(peak = keo len 0.95). Khong lam lech so do "
-                             "suppress vi ap sau khi do xong.")
+                        help="normalize the OUTPUT FILE loudness "
+                             "(peak = lift to 0.95). Applied after the "
+                             "measurement, so suppression figures stay honest.")
         sp.add_argument("--config", metavar="PATH",
-                        help="file config (mac dinh tu tim voice_lock.conf)")
+                        help="config file (voice_lock.conf is found "
+                             "automatically)")
         sp.add_argument("--no-config", action="store_true",
-                        help="bo qua file config")
+                        help="ignore the config file")
 
     # enroll
-    sp = sub.add_parser("enroll", help="tao speaker embedding")
+    sp = sub.add_parser("enroll", help="build a speaker embedding")
     sp.add_argument("--encoder", default=d("encoder", None),
-                    help="WavLM encoder ONNX (khuyen dung tren Pi 5 — "
-                         "khong can torch). Tao bang export_wavlm_onnx.py")
-    sp.add_argument("--wav", default=None, help="dung file wav 16 kHz co san")
+                    help="WavLM ONNX encoder (recommended on a Pi 5 - no "
+                         "torch needed). Build it with export_wavlm_onnx.py")
+    sp.add_argument("--wav", default=None, help="use an existing 16 kHz wav")
     sp.add_argument("--seconds", type=float, default=d("seconds", 10.0))
     sp.add_argument("--emb", default=d("emb", "speaker_emb.npy"))
     sp.add_argument("--out-wav", default=d("out_wav", "enrollment.wav"),
@@ -1260,13 +1274,13 @@ def main():
     sp.set_defaults(func=cmd_enroll)
 
     # bench
-    sp = sub.add_parser("bench", help="do latency / RTF tren Pi 5")
+    sp = sub.add_parser("bench", help="measure latency / RTF on a Pi 5")
     add_model_args(sp)
     sp.add_argument("--iters", type=int, default=d("iters", 20))
     sp.set_defaults(func=cmd_bench)
 
     # file
-    sp = sub.add_parser("file", help="tach giong tu file wav")
+    sp = sub.add_parser("file", help="extract the target voice from a wav")
     add_model_args(sp)
     sp.add_argument("-i", "--input", default=d("input", None),
                     required="input" not in cfg)
@@ -1274,7 +1288,7 @@ def main():
     sp.set_defaults(func=cmd_file)
 
     # verify
-    sp = sub.add_parser("verify", help="A/B giong dung vs giong sai")
+    sp = sub.add_parser("verify", help="A/B correct voice vs different voice")
     add_model_args(sp, need_emb=False)
     sp.add_argument("--emb-target", required=True, dest="emb_target")
     sp.add_argument("--emb-other", required=True, dest="emb_other")
@@ -1283,10 +1297,10 @@ def main():
     sp.set_defaults(func=cmd_verify)
 
     # live
-    sp = sub.add_parser("live", help="test realtime qua mic")
+    sp = sub.add_parser("live", help="realtime test through the mic")
     add_model_args(sp)
     sp.add_argument("--save", default=d("save", None),
-                    help="prefix luu wav in/out")
+                    help="prefix for the recorded input/output wav files")
     sp.add_argument("--in-device", default=d("in_device", None),
                     dest="in_device")
     sp.add_argument("--out-device", default=d("out_device", None),
@@ -1294,25 +1308,26 @@ def main():
     sp.set_defaults(func=cmd_live)
 
     # inspect
-    sp = sub.add_parser("inspect", help="chan doan chat luong embedding")
+    sp = sub.add_parser("inspect", help="diagnose embedding quality")
     sp.add_argument("--emb", nargs="+", default=[d("emb", "speaker_emb.npy")],
-                    help="mot hoac nhieu file .npy de so sanh")
+                    help="one or more .npy files to compare")
     sp.add_argument("--wav", default=None,
-                    help="ban ghi moi de doi chieu voi embedding da luu")
+                    help="a fresh recording to check against the stored "
+                         "embedding")
     sp.add_argument("--encoder", default=d("encoder", None))
     sp.add_argument("--config", metavar="PATH")
     sp.add_argument("--no-config", action="store_true")
     sp.set_defaults(func=cmd_inspect)
 
     # devices
-    sp = sub.add_parser("devices", help="liet ke thiet bi audio")
+    sp = sub.add_parser("devices", help="list audio devices")
     sp.set_defaults(func=cmd_devices)
 
     args = p.parse_args(argv)
     args.config_used = cfg_used
 
-    # Quy doi ten thiet bi (ke ca kieu ALSA 'plughw:2,0' trong config
-    # dung chung voi ban C++) sang chi so cua sounddevice.
+    # Translate device names (including ALSA-style 'plughw:2,0' coming from
+    # the config file shared with the C++ build) into sounddevice indices.
     for name, is_input in (("in_device", True), ("out_device", False)):
         if hasattr(args, name):
             setattr(args, name, resolve_device(getattr(args, name), is_input))
@@ -1320,10 +1335,10 @@ def main():
     try:
         args.func(args)
     except KeyboardInterrupt:
-        print("\nHuy.")
+        print("\nCancelled.")
         return 1
     except (FileNotFoundError, ValueError, RuntimeError) as e:
-        print(f"\nLOI: {e}", file=sys.stderr)
+        print(f"\nERROR: {e}", file=sys.stderr)
         return 1
 
     return 0
