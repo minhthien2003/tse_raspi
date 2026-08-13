@@ -20,8 +20,13 @@
 #include <sndfile.h>
 #include <portaudio.h>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <cstdio>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -559,27 +564,161 @@ static int pa_callback(const void* input,
     return paContinue;
 }
 
-static void realtime(V49Extractor& extractor, const std::string& save_prefix) {
+// PortAudio tham do het backend ALSA/JACK/OSS luc khoi tao, moi backend hong
+// deu in loi ra stderr ("jack server is not running", "Cannot open /dev/dsp",
+// "Unknown PCM iec958..."). Deu vo hai. Nuot stderr trong luc do; loi that van
+// duoc bao qua ma loi PaError nen khong mat thong tin.
+class StderrSilencer {
+public:
+    explicit StderrSilencer(bool active) {
+        if (!active) return;
+        std::fflush(stderr);
+        saved_ = dup(STDERR_FILENO);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (saved_ >= 0 && devnull >= 0) dup2(devnull, STDERR_FILENO);
+        if (devnull >= 0) close(devnull);
+    }
+    ~StderrSilencer() { restore(); }
+    void restore() {
+        if (saved_ < 0) return;
+        std::fflush(stderr);
+        dup2(saved_, STDERR_FILENO);
+        close(saved_);
+        saved_ = -1;
+    }
+    StderrSilencer(const StderrSilencer&) = delete;
+    StderrSilencer& operator=(const StderrSilencer&) = delete;
+private:
+    int saved_ = -1;
+};
+
+// spec rong  -> thiet bi mac dinh
+// spec la so -> chi so thiet bi
+// nguoc lai  -> khop chuoi con, khong phan biet hoa thuong, trong ten thiet bi
+static PaDeviceIndex resolve_device(const std::string& spec, bool input) {
+    if (spec.empty())
+        return input ? Pa_GetDefaultInputDevice() : Pa_GetDefaultOutputDevice();
+
+    bool numeric = !spec.empty() &&
+                   spec.find_first_not_of("0123456789") == std::string::npos;
+    if (numeric) {
+        int idx = std::stoi(spec);
+        if (idx < 0 || idx >= Pa_GetDeviceCount())
+            throw std::runtime_error("Device index out of range: " + spec);
+        return idx;
+    }
+
+    std::string needle = spec;
+    std::transform(needle.begin(), needle.end(), needle.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+
+    for (PaDeviceIndex i = 0; i < Pa_GetDeviceCount(); ++i) {
+        const PaDeviceInfo* info = Pa_GetDeviceInfo(i);
+        if (!info || !info->name) continue;
+        int channels = input ? info->maxInputChannels : info->maxOutputChannels;
+        if (channels < 1) continue;
+
+        std::string name = info->name;
+        std::transform(name.begin(), name.end(), name.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (name.find(needle) != std::string::npos) return i;
+    }
+    throw std::runtime_error("No " + std::string(input ? "input" : "output") +
+                             " device matching: " + spec);
+}
+
+static void describe_device(const char* label, PaDeviceIndex idx) {
+    const PaDeviceInfo* info = Pa_GetDeviceInfo(idx);
+    std::cout << "  " << label << ": [" << idx << "] "
+              << (info && info->name ? info->name : "?") << "\n";
+}
+
+static void list_devices(bool quiet_probe) {
+    {
+        StderrSilencer hush(quiet_probe);
+        PaError err = Pa_Initialize();
+        hush.restore();
+        if (err != paNoError) throw std::runtime_error(Pa_GetErrorText(err));
+    }
+
+    std::cout << "\nAudio devices (in/out channels):\n";
+    PaDeviceIndex def_in = Pa_GetDefaultInputDevice();
+    PaDeviceIndex def_out = Pa_GetDefaultOutputDevice();
+
+    for (PaDeviceIndex i = 0; i < Pa_GetDeviceCount(); ++i) {
+        const PaDeviceInfo* info = Pa_GetDeviceInfo(i);
+        if (!info) continue;
+        std::cout << "  [" << std::setw(2) << i << "] "
+                  << std::setw(2) << info->maxInputChannels << "in "
+                  << std::setw(2) << info->maxOutputChannels << "out  "
+                  << (info->name ? info->name : "?");
+        if (i == def_in) std::cout << "   (default in)";
+        if (i == def_out) std::cout << "   (default out)";
+        std::cout << "\n";
+    }
+
+    if (def_in == paNoDevice)  std::cout << "\n  WARNING: no default input device\n";
+    if (def_out == paNoDevice) std::cout << "  WARNING: no default output device\n";
+    std::cout << "\nUse --in-device / --out-device with an index or a name substring.\n";
+
+    Pa_Terminate();
+}
+
+static void realtime(V49Extractor& extractor, const std::string& save_prefix,
+                     const std::string& in_spec, const std::string& out_spec,
+                     bool quiet_probe) {
     RealtimeContext ctx;
     ctx.extractor = &extractor;
     ctx.save_prefix = save_prefix;
 
+    StderrSilencer hush(quiet_probe);
     PaError err = Pa_Initialize();
-    if (err != paNoError) throw std::runtime_error(Pa_GetErrorText(err));
+    if (err != paNoError) {
+        hush.restore();
+        throw std::runtime_error(Pa_GetErrorText(err));
+    }
 
     PaStream* stream = nullptr;
     PaStreamParameters inputParams{};
     PaStreamParameters outputParams{};
 
-    inputParams.device = Pa_GetDefaultInputDevice();
+    try {
+        inputParams.device = resolve_device(in_spec, true);
+        outputParams.device = resolve_device(out_spec, false);
+    } catch (...) {
+        Pa_Terminate();
+        hush.restore();
+        throw;
+    }
+
+    // Pa_GetDefaultInputDevice() tra paNoDevice khi khong co mic (Pi 5 khong co
+    // mic tich hop). Phai chan o day, neu khong Pa_GetDeviceInfo(-1) tra nullptr
+    // va deref se segfault.
+    auto require = [&](PaDeviceIndex idx, const char* what, const char* flag)
+                       -> const PaDeviceInfo* {
+        const PaDeviceInfo* info =
+            (idx == paNoDevice) ? nullptr : Pa_GetDeviceInfo(idx);
+        if (!info) {
+            Pa_Terminate();
+            hush.restore();
+            throw std::runtime_error(
+                std::string("No usable ") + what + " device. "
+                "Run --list-devices, then pick one with " + flag +
+                " (index or name substring).");
+        }
+        return info;
+    };
+
+    const PaDeviceInfo* in_info = require(inputParams.device, "input", "--in-device");
+    const PaDeviceInfo* out_info = require(outputParams.device, "output", "--out-device");
+
     inputParams.channelCount = 1;
     inputParams.sampleFormat = paFloat32;
-    inputParams.suggestedLatency = Pa_GetDeviceInfo(inputParams.device)->defaultLowInputLatency;
+    inputParams.suggestedLatency = in_info->defaultLowInputLatency;
 
-    outputParams.device = Pa_GetDefaultOutputDevice();
     outputParams.channelCount = 1;
     outputParams.sampleFormat = paFloat32;
-    outputParams.suggestedLatency = Pa_GetDeviceInfo(outputParams.device)->defaultLowOutputLatency;
+    outputParams.suggestedLatency = out_info->defaultLowOutputLatency;
 
     const unsigned long blocksize = HOP_SAMPLES;
 
@@ -587,16 +726,23 @@ static void realtime(V49Extractor& extractor, const std::string& save_prefix) {
                         SR, blocksize, paNoFlag, pa_callback, &ctx);
     if (err != paNoError) {
         Pa_Terminate();
-        throw std::runtime_error(Pa_GetErrorText(err));
+        hush.restore();
+        throw std::runtime_error(std::string(Pa_GetErrorText(err)) +
+                                 " (try --list-devices)");
     }
 
     err = Pa_StartStream(stream);
     if (err != paNoError) {
         Pa_CloseStream(stream);
         Pa_Terminate();
+        hush.restore();
         throw std::runtime_error(Pa_GetErrorText(err));
     }
 
+    hush.restore();
+
+    describe_device("input ", inputParams.device);
+    describe_device("output", outputParams.device);
     std::cout << "\n  chunk: 3s, hop: 1.5s\n";
     if (!save_prefix.empty())
         std::cout << "  recording to: " << save_prefix << "_input.wav / "
@@ -639,14 +785,19 @@ static void usage(const char* p) {
         "  --file INPUT.wav   process WAV instead of live audio\n"
         "  -o OUTPUT.wav      output WAV in file mode\n"
         "  --save PREFIX      save realtime input/output WAV\n"
-        "  --bench            benchmark inference and exit\n";
+        "  --bench            benchmark inference and exit\n"
+        "  --list-devices     list audio devices and exit\n"
+        "  --in-device SPEC   input device: index or name substring\n"
+        "  --out-device SPEC  output device: index or name substring\n"
+        "  --verbose-audio    show ALSA/JACK probe messages on stderr\n";
 }
 
 int main(int argc, char** argv) {
     try {
         std::string model, emb, file, output = "extracted.wav", save;
+        std::string in_device, out_device;
         float power = 2.0f, gain = 2.0f;
-        bool bench = false;
+        bool bench = false, list_dev = false, quiet_probe = true;
 
         for (int i = 1; i < argc; ++i) {
             std::string a = argv[i];
@@ -663,8 +814,18 @@ int main(int argc, char** argv) {
             else if (a == "-o" || a == "--output") output = need("--output");
             else if (a == "--save") save = need("--save");
             else if (a == "--bench") bench = true;
+            else if (a == "--list-devices") list_dev = true;
+            else if (a == "--in-device") in_device = need("--in-device");
+            else if (a == "--out-device") out_device = need("--out-device");
+            else if (a == "--verbose-audio") quiet_probe = false;
             else if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
             else throw std::runtime_error("Unknown argument: " + a);
+        }
+
+        // Liet ke thiet bi khong can model, chay duoc truoc khi cau hinh xong.
+        if (list_dev) {
+            list_devices(quiet_probe);
+            return 0;
         }
 
         if (model.empty() || emb.empty()) {
@@ -682,7 +843,7 @@ int main(int argc, char** argv) {
 
         if (bench) benchmark(extractor);
         else if (!file.empty()) process_file(extractor, file, output);
-        else realtime(extractor, save);
+        else realtime(extractor, save, in_device, out_device, quiet_probe);
 
     } catch (const Ort::Exception& e) {
         std::cerr << "\nONNX Runtime error: " << e.what() << "\n";

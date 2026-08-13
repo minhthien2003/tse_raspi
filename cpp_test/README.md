@@ -79,6 +79,27 @@ The ONNX Runtime `lib/` directory is baked into the binary's RPATH, so no `LD_LI
   --bench
 ```
 
+## Audio devices
+
+The Pi 5 has no built-in microphone, so a USB mic or sound card is required for
+real-time mode. List what PortAudio sees:
+
+```bash
+./build/v49_pi5 --list-devices
+```
+
+Then select by index or by name substring:
+
+```bash
+./build/v49_pi5 --model v49_int8.onnx --emb speaker_emb.npy \
+  --in-device "USB" --out-device 1
+```
+
+PortAudio probes every ALSA/JACK/OSS backend at startup and each unavailable one
+prints to stderr (`jack server is not running`, `Cannot open device /dev/dsp`,
+`Unknown PCM iec958...`). These are harmless and are suppressed by default; pass
+`--verbose-audio` to see them.
+
 ## Real-time
 
 ```bash
